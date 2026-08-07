@@ -1,0 +1,9 @@
+component Ruby {
+  control;
+}
+
+assembly {
+  composition {
+    component Ruby ruby;
+  }
+}

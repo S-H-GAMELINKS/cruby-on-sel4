@@ -1,0 +1,6 @@
+/vendor/camkes-project/
+/vendor/*/build*/
+/build/
+/build-*/
+/CMakeFiles/
+/CMakeCache.txt
