@@ -8,6 +8,12 @@ set -eu
 REPO_ROOT=$(cd "$(dirname "$0")" && pwd)
 CAMKES_DIR="$REPO_ROOT/vendor/camkes-project"
 
+# Need baseruby: CRuby's cross-compiling configure requires a host ruby
+if ! command -v ruby >/dev/null 2>&1; then
+    sudo apt update
+    sudo apt install -y ruby
+fi
+
 if [ ! -d "$CAMKES_DIR/.repo" ]; then
     mkdir -p "$CAMKES_DIR"
     (cd "$CAMKES_DIR" \

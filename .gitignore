@@ -1,4 +1,6 @@
+.yorishiro/*
 /vendor/camkes-project/
+/vendor/ruby-*
 /vendor/*/build*/
 /build/
 /build-*/
