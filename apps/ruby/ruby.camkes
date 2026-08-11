@@ -6,4 +6,8 @@ assembly {
   composition {
     component Ruby ruby;
   }
+
+  configuration {
+    ruby._stack_size = 1024 * 1024;
+  }
 }

@@ -69,6 +69,11 @@ ExternalProject_Add(
             ac_cv_func_popen=no
             ac_cv_func_getpgrp=no
             ac_cv_func_setpgid=no
+            # configure runs without -nostdinc and finds gcc's C23 stdckdint.h,
+            # but CAmkES components compile with -nostdinc, where only the staged
+            # musl headers are visible and stdckdint.h is absent. Force CRuby onto
+            # its __builtin_*_overflow fallback instead.
+            ac_cv_header_stdckdint_h=no
     BUILD_COMMAND make -j${CRUBY_JOBS} libruby-static.a
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS "${CRUBY_STATIC_LIB}"
@@ -91,6 +96,13 @@ DeclareCAmkESComponent(
     Ruby
     SOURCES
         src/ruby.c
+        src/ruby_alloc.c
+        src/stub/ruby_pthread.c
+        src/stub/ruby_syscall_clock.c
+        src/stub/ruby_syscall_poll.c
+        src/stub/ruby_syscall_proc.c
+        src/stub/ruby_syscall_random.c
+        src/stub/ruby_syscall_tty.c
     INCLUDES
         "${CRUBY_BUILD_DIR}/.ext/include/x86_64-linux-musl"
         "${CRUBY_SRC_DIR}/include"
