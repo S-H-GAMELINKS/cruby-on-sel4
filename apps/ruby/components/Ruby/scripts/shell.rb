@@ -1,4 +1,4 @@
-#=begin
+=begin
 require "reline"
 
 loop do
@@ -9,8 +9,32 @@ loop do
   
   eval(buffer)
 end
-#=end
+=end
 
-puts "Ruby script loaded from CPIO"
-puts RUBY_VERSION
-puts (1 + 1)
+while true
+  print "ruby> "
+  $stdout.flush
+
+  begin
+    line = STDIN.gets
+  rescue => e
+    puts
+    puts "stdin unavailable: #{e.class}: #{e.message}"
+    $stdout.flush
+    line = nil
+  end
+
+  if line.nil?
+    puts "stdin closed; shell idle"
+    $stdout.flush
+    while true
+    end
+  end
+
+  line = line.strip
+  next if line.empty?
+  break if line == "exit"
+
+  puts eval(line)
+  $stdout.flush
+end

@@ -92,3 +92,34 @@ int mprotect(void *addr, size_t len, int prot)
     (void)prot;
     return 0;
 }
+
+/*
+ * There are no users or privilege levels in a CAmkES component: the whole system
+ * is described statically and a component's authority is its capabilities, not a
+ * uid. CRuby queries these while initialising, and libsel4muslcsys has no handler
+ * for them, so the calls surface as "Error attempting syscall 107" and "108".
+ *
+ * Reporting 0 for all four means Ruby sees a single unprivileged-but-consistent
+ * identity where real and effective ids match, which is the shape its checks
+ * expect. Note that Ruby reads 0 as root, so anything gating on uid == 0 will
+ * take its privileged branch; nothing in this component acts on that today.
+ */
+uid_t getuid(void)
+{
+    return 0;
+}
+
+uid_t geteuid(void)
+{
+    return 0;
+}
+
+gid_t getgid(void)
+{
+    return 0;
+}
+
+gid_t getegid(void)
+{
+    return 0;
+}

@@ -66,6 +66,18 @@ int run(void) {
 
   trace("CRuby initialize");
   ruby_init();
+  /* Load the parts of core implemented in Ruby rather than C: kernel.rb,
+   * numeric.rb, io.rb and friends. rb_call_builtin_inits() is normally reached
+   * through ruby_process_options -> ruby_opt_init (ruby.c:1815), which is the
+   * command-line path an embedded VM never takes. ruby_init() only enables
+   * builtin loading; it does not perform it.
+   *
+   * Without this, methods defined in those files are simply absent --
+   * Kernel#class lives in kernel.rb:18 -- and NameError message construction,
+   * which is also Ruby-level, degrades to inspecting the raw symbol. The symbol
+   * is not declared in any installed header, so declare it here. */
+  extern void rb_call_builtin_inits(void);
+  rb_call_builtin_inits();
   trace("ruby_init done");
 
   rb_eval_string_protect("$stdout.sync = true", &state);

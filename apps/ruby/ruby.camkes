@@ -1,13 +1,27 @@
+import <std_connector.camkes>;
+import <SerialServer/SerialServer.camkes>;
+import <TimeServer/TimeServer.camkes>;
+import <global-connectors.camkes>;
+
 component Ruby {
   control;
+  uses GetChar stdin_getchar;
 }
 
 assembly {
   composition {
     component Ruby ruby;
+      component SerialServer serial;
+    component TimeServer time_server;
+
+    connection seL4RPCCall serial_time_server(from time_server.putchar, to serial.processed_putchar);
+    connection seL4TimeServer serialserver_timer(from serial.timeout, to time_server.the_timer);
+    connection seL4SerialServer stdin_input(from ruby.stdin_getchar, to serial.getchar);
   }
 
   configuration {
     ruby._stack_size = 1024 * 1024;
+    ruby.stdin_getchar_shmem_size = 0x1000;
+    time_server.timers_per_client = 1;
   }
 }

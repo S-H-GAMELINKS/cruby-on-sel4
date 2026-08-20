@@ -286,9 +286,21 @@ void *__libc_realloc(void *ptr, size_t size)
  * Anonymous mappings come from the same arena, page aligned. Protection flags and
  * file offsets are ignored: there is one flat address space here and no file
  * backing, so there is nothing to honour.
+ *
+ * Two things mmap guarantees that plain malloc does not, and both matter to
+ * Ruby's GC:
+ *
+ *  - The mapping is zeroed. arena_alloc may satisfy a request from the free list,
+ *    which holds whatever the previous owner left behind, so the block has to be
+ *    cleared here. Skipping this corrupts freshly allocated GC heap pages in ways
+ *    that surface much later as unresolvable symbols or bogus objects.
+ *  - The mapping spans whole pages. Callers may legitimately touch every byte up
+ *    to the page boundary, so round the request up rather than handing back a
+ *    block that ends mid-page.
  */
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
+    size_t rounded;
     void *ptr;
 
     (void)addr;
@@ -297,11 +309,23 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     (void)fd;
     (void)offset;
 
-    ptr = arena_alloc(length, MMAP_ALIGNMENT);
+    if (length == 0) {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+
+    rounded = (length + MMAP_ALIGNMENT - 1) & ~(size_t)(MMAP_ALIGNMENT - 1);
+    if (rounded < length) {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+
+    ptr = arena_alloc(rounded, MMAP_ALIGNMENT);
     if (ptr == NULL) {
         return MAP_FAILED;
     }
 
+    memset(ptr, 0, rounded);
     return ptr;
 }
 
