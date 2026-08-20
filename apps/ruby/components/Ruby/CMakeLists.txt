@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.16.0)
 
 project(ComponentRuby C)
 
+include(cpio)
 include(ExternalProject)
 include(ProcessorCount)
 
@@ -90,6 +91,26 @@ add_library(cruby_static STATIC IMPORTED GLOBAL)
 add_dependencies(cruby_static cruby_external)
 set_property(TARGET cruby_static PROPERTY IMPORTED_LOCATION "${CRUBY_STATIC_LIB}")
 
+# MakeCPIO emits archive.<name>.cpio, <name>.S and <name> into the build tree and
+# nothing into the source tree, so no generated embedding code is ever committed.
+# Its default symbol pair _cpio_archive/_cpio_archive_end is exactly what
+# libsel4muslcsys registers when LibSel4MuslcSysCPIOFS is enabled
+# (libsel4muslcsys/src/vsyscall.c:241-248), so no symbol name needs overriding.
+set(RUBY_SCRIPT_DIR "${CMAKE_CURRENT_LIST_DIR}/scripts")
+set(RUBY_ARCHIVE_OBJ "${CMAKE_CURRENT_BINARY_DIR}/ruby_archive.o")
+
+MakeCPIO(ruby_archive.o "${RUBY_SCRIPT_DIR}/shell.rb")
+
+# MakeCPIO declares an add_custom_command; something has to depend on its output
+# for the rule to run.
+add_custom_target(ruby_archive_gen DEPENDS "${RUBY_ARCHIVE_OBJ}")
+
+# Same pattern as cruby_static above, and as muslc_imported upstream: an IMPORTED
+# target can be named in LIBS, and add_dependencies gives CMake the ordering.
+add_library(ruby_archive OBJECT IMPORTED GLOBAL)
+add_dependencies(ruby_archive ruby_archive_gen)
+set_property(TARGET ruby_archive PROPERTY IMPORTED_OBJECTS "${RUBY_ARCHIVE_OBJ}")
+
 # These include directories do not exist until cruby_external has built. That is
 # fine: CAmkES resolves absolute include paths without requiring them to exist.
 DeclareCAmkESComponent(
@@ -97,6 +118,7 @@ DeclareCAmkESComponent(
     SOURCES
         src/ruby.c
         src/ruby_alloc.c
+        src/ruby_syscall_fs.c
         src/stub/ruby_pthread.c
         src/stub/ruby_syscall_clock.c
         src/stub/ruby_syscall_poll.c
@@ -108,4 +130,5 @@ DeclareCAmkESComponent(
         "${CRUBY_SRC_DIR}/include"
     LIBS
         cruby_static
+        ruby_archive
 )

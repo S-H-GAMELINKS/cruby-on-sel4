@@ -1,17 +1,84 @@
 #include <ruby.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static void trace(const char* message) {
   printf("%s\n", message);
   fflush(stdout);
 }
 
+static char *read_script(const char *path)
+{
+    int fd;
+    struct stat st;
+    char *buffer;
+    size_t used = 0;
+    size_t buffer_size;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        printf("failed to open %s: %s\n", path, strerror(errno));
+        return 0;
+    }
+
+    if (fstat(fd, &st) != 0 || st.st_size < 0) {
+        printf("failed to stat %s: %s\n", path, strerror(errno));
+        close(fd);
+        return 0;
+    }
+
+    buffer_size = (size_t)st.st_size + 1;
+    buffer = malloc(buffer_size);
+    if (buffer == 0) {
+        printf("failed to allocate script buffer\n");
+        close(fd);
+        return 0;
+    }
+
+    while (used + 1 < buffer_size) {
+        ssize_t n = read(fd, buffer + used, buffer_size - used - 1);
+
+        if (n < 0) {
+            printf("failed to read %s: %s\n", path, strerror(errno));
+            close(fd);
+            free(buffer);
+            return 0;
+        }
+        if (n == 0) {
+            break;
+        }
+        used += (size_t)n;
+    }
+
+    close(fd);
+    buffer[used] = 0;
+    return buffer;
+}
+
 int run(void) {
+  int state = 0;
+  char *script;
+
   trace("CRuby initialize");
   ruby_init();
   trace("ruby_init done");
 
-  rb_eval_string("puts 'Hello World from CRuby on seL4!'");
+  rb_eval_string_protect("$stdout.sync = true", &state);
+
+  script = read_script("/shell.rb");
+  if (script != 0) {
+      rb_eval_string_protect(script, &state);
+      free(script);
+      if (state != 0) {
+          trace("ruby exception from CPIO script");
+          rb_p(rb_errinfo());
+      }
+  }
 
   trace("Finalize CRuby");
   ruby_finalize();
