@@ -66,6 +66,18 @@ int run(void) {
 
   trace("CRuby initialize");
   ruby_init();
+
+  /* Register the statically linked extensions. ruby_opt_init() does this at
+   * ruby.c:1828 -- "load statically linked extensions before rubygems" -- and
+   * that is the same command-line path that also performs the builtin loading
+   * below, so an embedded VM reaches neither. Without it require 'io/console'
+   * fails with LoadError even though the extension is linked in: extinit.c
+   * registers each one through ruby_init_ext, and nothing calls it.
+   *
+   * Neither symbol appears in an installed header, so declare both here. */
+  extern void Init_ext(void);
+  Init_ext();
+
   /* Load the parts of core implemented in Ruby rather than C: kernel.rb,
    * numeric.rb, io.rb and friends. rb_call_builtin_inits() is normally reached
    * through ruby_process_options -> ruby_opt_init (ruby.c:1815), which is the

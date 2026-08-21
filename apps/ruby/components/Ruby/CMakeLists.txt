@@ -32,6 +32,16 @@ set(CRUBY_SRC_DIR "${CRUBY_PREFIX}/src/cruby_external")
 set(CRUBY_BUILD_DIR "${CRUBY_PREFIX}/build")
 set(CRUBY_STATIC_LIB "${CRUBY_BUILD_DIR}/libruby-static.a")
 
+# Statically linked extensions are not part of libruby-static.a: common.mk:400
+# builds that archive from the core objects only, and common.mk:398 links the
+# extensions separately. extinit.c registers each one under its ".so" name via
+# ruby_init_ext, so `require 'io/console'` resolves without touching the
+# filesystem.
+set(CRUBY_EXT_INIT_OBJ "${CRUBY_BUILD_DIR}/ext/extinit.o")
+set(CRUBY_EXT_CONSOLE_LIB "${CRUBY_BUILD_DIR}/ext/io/console/console.a")
+set(CRUBY_EXT_WAIT_LIB "${CRUBY_BUILD_DIR}/ext/io/wait/wait.a")
+
+
 ExternalProject_Add(
     cruby_external
     PREFIX "${CRUBY_PREFIX}"
@@ -75,9 +85,19 @@ ExternalProject_Add(
             # musl headers are visible and stdckdint.h is absent. Force CRuby onto
             # its __builtin_*_overflow fallback instead.
             ac_cv_header_stdckdint_h=no
-    BUILD_COMMAND make -j${CRUBY_JOBS} libruby-static.a
+            # reline needs io/console and io/wait. Building every extension would
+            # fail on the ones wanting zlib, openssl and friends, none of which
+            # exist in this sysroot. ext/Setup is no longer consulted in Ruby 4.0;
+            # exts.mk is generated from configure's selection instead.
+            --with-ext=io/console,io/wait
+    BUILD_COMMAND make -j${CRUBY_JOBS} exts
+    COMMAND make -j${CRUBY_JOBS} libruby-static.a
     INSTALL_COMMAND ""
-    BUILD_BYPRODUCTS "${CRUBY_STATIC_LIB}"
+    BUILD_BYPRODUCTS
+      "${CRUBY_STATIC_LIB}"
+      "${CRUBY_EXT_INIT_OBJ}"
+      "${CRUBY_EXT_CONSOLE_LIB}"
+      "${CRUBY_EXT_WAIT_LIB}"
     # Stream configure/build output instead of capturing it to log files. During
     # bring-up the failures are the point.
     USES_TERMINAL_DOWNLOAD TRUE
@@ -90,6 +110,18 @@ ExternalProject_Add(
 add_library(cruby_static STATIC IMPORTED GLOBAL)
 add_dependencies(cruby_static cruby_external)
 set_property(TARGET cruby_static PROPERTY IMPORTED_LOCATION "${CRUBY_STATIC_LIB}")
+
+add_library(cruby_ext_init OBJECT IMPORTED GLOBAL)
+add_dependencies(cruby_ext_init cruby_external)
+set_property(TARGET cruby_ext_init PROPERTY IMPORTED_OBJECTS "${CRUBY_EXT_INIT_OBJ}")
+
+add_library(cruby_ext_console STATIC IMPORTED GLOBAL)
+add_dependencies(cruby_ext_console cruby_external)
+set_property(TARGET cruby_ext_console PROPERTY IMPORTED_LOCATION "${CRUBY_EXT_CONSOLE_LIB}")
+
+add_library(cruby_ext_wait STATIC IMPORTED GLOBAL)
+add_dependencies(cruby_ext_wait cruby_external)
+set_property(TARGET cruby_ext_wait PROPERTY IMPORTED_LOCATION "${CRUBY_EXT_WAIT_LIB}")
 
 # MakeCPIO emits archive.<name>.cpio, <name>.S and <name> into the build tree and
 # nothing into the source tree, so no generated embedding code is ever committed.
@@ -129,6 +161,12 @@ DeclareCAmkESComponent(
         "${CRUBY_BUILD_DIR}/.ext/include/x86_64-linux-musl"
         "${CRUBY_SRC_DIR}/include"
     LIBS
+        # extinit.o first: it needs Init_io_console and Init_io_wait from the
+        # archives after it, and libruby's undefined Init_ext is satisfied by an
+        # object regardless of position.
+        cruby_ext_init
+        cruby_ext_console
+        cruby_ext_wait
         cruby_static
         ruby_archive
 )

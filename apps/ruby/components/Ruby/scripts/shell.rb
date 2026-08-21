@@ -10,7 +10,8 @@ loop do
   eval(buffer)
 end
 =end
-
+require 'io/console'
+puts "io/console loaded"
 while true
   print "ruby> "
   $stdout.flush
