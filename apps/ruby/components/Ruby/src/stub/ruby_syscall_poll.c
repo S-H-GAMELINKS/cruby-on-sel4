@@ -45,12 +45,15 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
+
+#include <muslcsys/vsyscall.h>
 
 /* Generated declarations for stdin_getchar_get_buf() and
  * stdin_getchar_notification(), from the seL4SerialServer connection. */
@@ -338,6 +341,13 @@ static volatile serial_ring_t *serial_ring(void)
  * drained, and conversely no fresh notification arrives while the client sits on
  * an unread buffer. Re-checking head against tail on every wakeup covers both.
  */
+static int serial_has_input(void)
+{
+    volatile serial_ring_t *ring = serial_ring();
+
+    return ring->head != ring->tail;
+}
+
 static char serial_getchar(void)
 {
     volatile serial_ring_t *ring = serial_ring();
@@ -352,68 +362,33 @@ static char serial_getchar(void)
     return c;
 }
 
-#define SERIAL_EOT 0x04 /* Ctrl-D */
-#define SERIAL_ESC 0x1b
-#define SERIAL_DEL 0x7f
-
-static void serial_write(const char *s, size_t len)
-{
-    (void)write(STDOUT_FILENO, s, len);
-}
-
-/* There is no line discipline behind the debug console, so echo has to be done
- * here or typing is invisible.
- *
- * A bare newline suffices: the kernel console driver prepends a carriage return
- * to every '\n' (kernel/include/drivers/uart.h:16-20), so echoing "\r\n" would
- * put two carriage returns on the wire. */
-static void serial_echo(char c)
-{
-    if (c == '\r' || c == '\n') {
-        serial_write("\n", 1);
-    } else {
-        serial_write(&c, 1);
-    }
-}
-
-/* Step back over the last echoed character and blank it. */
-static void serial_erase(void)
-{
-    serial_write("\b \b", 3);
-}
-
 /*
- * Swallow a CSI or SS3 sequence. Arrow and function keys arrive as ESC followed
- * by '[' or 'O', optional parameter bytes, and a final byte in 0x40..0x7e.
- * Acting on cursor movement would need a full line editor and a model of what is
- * on screen; discarding the sequence at least keeps the escape bytes out of the
- * line Ruby receives.
+ * Deliver raw bytes; Reline owns the line.
+ *
+ * Reline drives the terminal itself: it renders the prompt and the buffer, parses
+ * the escape sequences that arrow and function keys produce, and implements
+ * backspace, history and kill-ring. Echoing or editing here duplicates all of
+ * that -- the visible symptom was every line appearing twice -- and discarding
+ * escape sequences would take the cursor keys away from it.
+ *
+ * So this behaves like a character device: block until at least one byte is
+ * available, then hand over whatever else has already arrived. Bytes are passed
+ * through unchanged, carriage returns included, because Reline maps both CR and
+ * LF to accept-line itself.
+ *
+ * The cost is that a reader which does not echo -- a plain STDIN.gets -- shows
+ * nothing as it is typed. Serving both would mean honouring the termios ECHO and
+ * ICANON flags, which needs the ioctl surface this component does not have yet.
  */
-static void serial_discard_escape(void)
+static char serial_take(void)
 {
-    char c = serial_getchar();
+    volatile serial_ring_t *ring = serial_ring();
+    char c = ring->buf[ring->head];
 
-    if (c != '[' && c != 'O') {
-        return;
-    }
-    do {
-        c = serial_getchar();
-    } while ((unsigned char)c < 0x40 || (unsigned char)c > 0x7e);
+    ring->head = (ring->head + 1) % sizeof(ring->buf);
+    return c;
 }
 
-/*
- * Read one edited line.
- *
- * Ruby's STDIN.gets wants a line at a time, so this returns as soon as Enter
- * arrives rather than filling the caller's buffer. Backspace has to be handled
- * here rather than merely echoed: echoing the erase without dropping the
- * character leaves both the mistake and a literal 0x08 in what Ruby parses.
- *
- * Console input is line oriented, so a scatter read collapses into the first
- * usable buffer. Letting one edited line span several buffers would make
- * backspace cross buffer boundaries for no gain, and Ruby's IO layer passes a
- * single buffer here regardless.
- */
 static ssize_t serial_readv(const struct iovec *iov, int iovcnt)
 {
     char *base = NULL;
@@ -436,40 +411,9 @@ static ssize_t serial_readv(const struct iovec *iov, int iovcnt)
         return 0;
     }
 
-    while (used < capacity) {
-        char c = serial_getchar();
-
-        if (c == SERIAL_ESC) {
-            serial_discard_escape();
-            continue;
-        }
-        if (c == '\b' || c == SERIAL_DEL) {
-            if (used > 0) {
-                used--;
-                serial_erase();
-            }
-            continue;
-        }
-        if (c == '\r' || c == '\n') {
-            serial_echo('\n');
-            base[used++] = '\n';
-            return (ssize_t)used;
-        }
-        if (c == SERIAL_EOT) {
-            /* Ctrl-D ends input only on an empty line, as a terminal does. */
-            if (used == 0) {
-                return 0;
-            }
-            continue;
-        }
-        /* Drop the remaining control characters instead of letting them into the
-         * line; none of them mean anything without a real terminal. */
-        if ((unsigned char)c < 0x20) {
-            continue;
-        }
-
-        serial_echo(c);
-        base[used++] = c;
+    base[used++] = serial_getchar();
+    while (used < capacity && serial_has_input()) {
+        base[used++] = serial_take();
     }
 
     return (ssize_t)used;
@@ -638,4 +582,116 @@ int fcntl(int fd, int cmd, ...)
         errno = EINVAL;
         return -1;
     }
+}
+
+/*
+ * poll and ppoll.
+ *
+ * libsel4muslcsys installs no handler for either, so Reline's readability checks
+ * -- @input.wait_readable in reline/io/ansi.rb -- fail with ENOSYS and take the
+ * whole line editor with them. They are replaced at the syscall level rather than
+ * as libc wrappers because callers reach them by several routes, the same reason
+ * the open handlers live in ruby_syscall_fs.c.
+ *
+ * Readiness is decided from what this component actually knows: serial input is
+ * ready when the ring buffer is non-empty, a fake eventfd when its counter is
+ * non-zero, and everything else -- CPIO-backed files, the console -- is always
+ * ready. Writes never block here, so POLLOUT is always granted.
+ *
+ * A positive timeout is treated as "wait indefinitely". There is no clock to
+ * expire it against, and the only thing that can change readiness is serial
+ * input, so the wait ends when a key arrives.
+ *
+ * That approximation carries one real risk. cursor_pos_internal in
+ * reline/io/ansi.rb writes "\e[6n" and waits for the terminal to report the
+ * cursor position; since ruby_syscall_tty.c reports a tty, that path is live.
+ * QEMU hands the console to the host's terminal, which answers, so the wait ends.
+ * A console that never answers would hang here instead of timing out. Removing
+ * the risk means giving these timeouts real expiry -- TimeServer is already in the
+ * assembly for SerialServer, so a timer connection for this component is the
+ * obvious route.
+ */
+static long poll_fds(struct pollfd *fds, unsigned long nfds, int blocking)
+{
+    unsigned long i;
+    int watching_stdin = 0;
+
+    if (fds == NULL && nfds != 0) {
+        return -EFAULT;
+    }
+
+    for (i = 0; i < nfds; i++) {
+        fds[i].revents = 0;
+        if (fds[i].fd == STDIN_FILENO && (fds[i].events & POLLIN) != 0) {
+            watching_stdin = 1;
+        }
+    }
+
+    for (;;) {
+        int ready = 0;
+
+        for (i = 0; i < nfds; i++) {
+            int readable;
+
+            if (fds[i].fd < 0) {
+                continue;
+            }
+
+            if (fds[i].fd == STDIN_FILENO) {
+                readable = serial_has_input();
+            } else {
+                fake_eventfd_t *event = fake_eventfd_from_fd(fds[i].fd);
+
+                readable = event != NULL ? event->counter > 0 : 1;
+            }
+
+            if (readable && (fds[i].events & POLLIN) != 0) {
+                fds[i].revents |= POLLIN;
+            }
+            if ((fds[i].events & POLLOUT) != 0) {
+                fds[i].revents |= POLLOUT;
+            }
+            if (fds[i].revents != 0) {
+                ready++;
+            }
+        }
+
+        if (ready > 0 || !blocking || !watching_stdin) {
+            return ready;
+        }
+
+        seL4_Wait(stdin_getchar_notification(), NULL);
+    }
+}
+
+static long ruby_sys_poll(va_list ap)
+{
+    struct pollfd *fds = va_arg(ap, struct pollfd *);
+    unsigned long nfds = va_arg(ap, unsigned long);
+    int timeout_ms = va_arg(ap, int);
+
+    return poll_fds(fds, nfds, timeout_ms != 0);
+}
+
+static long ruby_sys_ppoll(va_list ap)
+{
+    struct pollfd *fds = va_arg(ap, struct pollfd *);
+    unsigned long nfds = va_arg(ap, unsigned long);
+    const struct timespec *timeout = va_arg(ap, const struct timespec *);
+
+    /* A NULL timeout means block; an all-zero one means do not. */
+    int blocking = timeout == NULL || timeout->tv_sec != 0 || timeout->tv_nsec != 0;
+
+    return poll_fds(fds, nfds, blocking);
+}
+
+/* Runs after libsel4muslcsys has its own table in place. */
+static void CONSTRUCTOR(MUSLCSYS_WITH_VSYSCALL_PRIORITY + 1) install_ruby_poll(void)
+{
+#ifdef __NR_poll
+    muslcsys_install_syscall(__NR_poll, ruby_sys_poll);
+#endif
+#ifdef __NR_ppoll
+    muslcsys_install_syscall(__NR_ppoll, ruby_sys_ppoll);
+#endif
 }

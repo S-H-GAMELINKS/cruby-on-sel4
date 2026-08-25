@@ -4,6 +4,11 @@
 # slash before looking an entry up, so one load path entry covers everything.
 $LOAD_PATH.unshift('/')
 
+# Reline looks for ~/.inputrc, and expanding '~' without HOME set sends Ruby to
+# getpwuid, which reads /etc/passwd. There is no user database here, so name the
+# root of the archive instead.
+ENV['HOME'] = '/'
+
 require 'reline'
 
 puts "Reline #{Reline::VERSION} on Ruby #{RUBY_VERSION}"

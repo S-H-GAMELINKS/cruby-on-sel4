@@ -37,8 +37,12 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <stdarg.h>
+#include <stdlib.h>
+
 #include <cpio/cpio.h>
 #include <muslcsys/io.h>
+#include <muslcsys/vsyscall.h>
 #include <utils/util.h>
 
 /* Emitted by MakeCPIO's generated assembly stub. */
@@ -50,10 +54,6 @@ static unsigned long archive_len(void)
     return (unsigned long)(_cpio_archive_end - _cpio_archive);
 }
 
-static void CONSTRUCTOR(CONSTRUCTOR_MIN_PRIORITY) install_ruby_cpio(void)
-{
-    muslcsys_install_cpio_interface(_cpio_archive, archive_len(), cpio_get_file);
-}
 
 static const char *normalize_path(const char *path)
 {
@@ -140,6 +140,96 @@ static int is_archive_directory(const char *name)
             return 1;
         }
     }
+}
+
+/*
+ * Replace the open syscalls rather than only the libc wrappers.
+ *
+ * libsel4muslcsys' sys_open_impl masks O_LARGEFILE and then asserts that nothing
+ * else is set, which turns an ordinary open into a dead component: musl's fopen
+ * passes O_CLOEXEC (its "e" mode flag), and fopen does not go through the public
+ * open() at all -- it issues SYS_openat directly, so overriding open() cannot
+ * catch it. musl's getpwuid reaching for /etc/passwd is one such caller, by way of
+ * Ruby expanding '~'.
+ *
+ * Failing to find a file also has to be an error rather than an assertion. A
+ * missing file is a completely ordinary thing for Ruby to probe for.
+ *
+ * The descriptor is registered exactly as sys_open_impl would, so the read, lseek
+ * and close handlers in libsel4muslcsys continue to serve it.
+ */
+static long open_cpio(const char *pathname, int flags)
+{
+    unsigned long size = 0;
+    const void *file;
+    muslcsys_fd_t *fds;
+    cpio_file_data_t *data;
+    int fd;
+
+    if (pathname == NULL) {
+        return -EFAULT;
+    }
+    /* The archive is read only, so anything but a plain read has to fail. */
+    if ((flags & O_ACCMODE) != O_RDONLY) {
+        return -EROFS;
+    }
+
+    file = find_file(pathname, &size);
+    if (file == NULL) {
+        return -ENOENT;
+    }
+
+    fd = allocate_fd();
+    if (fd == -EMFILE) {
+        return -EMFILE;
+    }
+
+    fds = get_fd_struct(fd);
+    fds->filetype = FILE_TYPE_CPIO;
+    fds->data = malloc(sizeof(*data));
+    if (fds->data == NULL) {
+        add_free_fd(fd);
+        return -ENOMEM;
+    }
+
+    data = (cpio_file_data_t *)fds->data;
+    data->start = (const char *)file;
+    data->size = (uint32_t)size;
+    data->current = 0;
+    return fd;
+}
+
+static long ruby_sys_open(va_list ap)
+{
+    const char *pathname = va_arg(ap, const char *);
+    int flags = va_arg(ap, int);
+
+    return open_cpio(pathname, flags);
+}
+
+static long ruby_sys_openat(va_list ap)
+{
+    /* One flat namespace, so the directory descriptor carries no meaning. */
+    (void)va_arg(ap, int);
+    const char *pathname = va_arg(ap, const char *);
+    int flags = va_arg(ap, int);
+
+    return open_cpio(pathname, flags);
+}
+
+/* Runs after libsel4muslcsys has its own table in place, so these replacements
+ * are not overwritten. */
+static void CONSTRUCTOR(MUSLCSYS_WITH_VSYSCALL_PRIORITY + 1) install_ruby_fs(void)
+{
+    /* Kept as a fallback for any caller that still reaches sys_open_impl. */
+    muslcsys_install_cpio_interface(_cpio_archive, archive_len(), cpio_get_file);
+
+#ifdef __NR_open
+    muslcsys_install_syscall(__NR_open, ruby_sys_open);
+#endif
+#ifdef __NR_openat
+    muslcsys_install_syscall(__NR_openat, ruby_sys_openat);
+#endif
 }
 
 int open(const char *path, int flags, ...)
