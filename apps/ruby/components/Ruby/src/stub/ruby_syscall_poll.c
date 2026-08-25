@@ -605,5 +605,37 @@ int fcntl(int fd, int cmd, ...)
         }
     }
 
-    return (int)syscall(SYS_fcntl, fd, cmd, arg);
+    /*
+     * Everything else is a real descriptor, and libsel4muslcsys installs no
+     * fcntl handler (vsyscall.c has entries for open, openat, close and lseek
+     * only), so passing the call through yields -ENOSYS. CRuby treats that as a
+     * failed syscall and raises, which is how a plain descriptor query turned
+     * into a fault inside strerror.
+     *
+     * Answer the queries locally instead. There are no descriptor flags worth
+     * tracking here: nothing execs, so FD_CLOEXEC is meaningless, and reads never
+     * block in a way O_NONBLOCK would change.
+     */
+    switch (cmd) {
+    case F_GETFL:
+        if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
+            return O_WRONLY;
+        }
+        /* stdin and the CPIO-backed files are all read only. */
+        return O_RDONLY;
+    case F_SETFL:
+    case F_SETFD:
+        return 0;
+    case F_GETFD:
+        return 0;
+    case F_DUPFD:
+#ifdef F_DUPFD_CLOEXEC
+    case F_DUPFD_CLOEXEC:
+#endif
+        errno = EMFILE;
+        return -1;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
 }

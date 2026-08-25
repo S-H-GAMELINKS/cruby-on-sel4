@@ -35,6 +35,12 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 
+/* Needed to resolve a descriptor back to its CPIO entry for file-backed mmap.
+ * That case lives here rather than with the rest of the file surface because
+ * mmap is a single entry point serving both kinds of mapping, and the memory it
+ * returns comes from the arena below either way. */
+#include <muslcsys/io.h>
+
 /* Sized to carry CRuby through initialisation and a small script. Every 4 KiB
  * costs one capDL frame object, so raising this may require a larger
  * CapDLLoaderMaxObjects. Conversely, with this arena in place the CAmkES
@@ -298,6 +304,21 @@ void *__libc_realloc(void *ptr, size_t size)
  *    to the page boundary, so round the request up rather than handing back a
  *    block that ends mid-page.
  */
+static const cpio_file_data_t *cpio_file_for_fd(int fd)
+{
+    muslcsys_fd_t *fds;
+
+    if (fd < 0 || !valid_fd(fd)) {
+        return NULL;
+    }
+    fds = get_fd_struct(fd);
+    if (fds == NULL || fds->filetype != FILE_TYPE_CPIO || fds->data == NULL) {
+        return NULL;
+    }
+
+    return (const cpio_file_data_t *)fds->data;
+}
+
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
     size_t rounded;
@@ -305,9 +326,6 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 
     (void)addr;
     (void)prot;
-    (void)flags;
-    (void)fd;
-    (void)offset;
 
     if (length == 0) {
         errno = EINVAL;
@@ -318,6 +336,51 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     if (rounded < length) {
         errno = ENOMEM;
         return MAP_FAILED;
+    }
+
+    /*
+     * File-backed mappings have to carry the file's contents, not blank memory.
+     * CRuby loads every script this way: prism/util/pm_string.c:190 and
+     * prism_compile.c's pm_read_file both do
+     *
+     *     mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0)
+     *
+     * and neither falls back to read() when that fails -- they return
+     * PM_STRING_INIT_ERROR_GENERIC. Handing back zeroed memory instead makes
+     * every required file parse as an empty program: require succeeds, the
+     * feature is recorded, and nothing is defined.
+     *
+     * The contents are already resident in the embedded CPIO archive, so this
+     * copies from there. Copying rather than aliasing the archive directly keeps
+     * the two guarantees callers rely on: the result is page aligned, and the
+     * remainder of the final page reads as zero.
+     */
+    if (!(flags & MAP_ANONYMOUS) && fd >= 0) {
+        const cpio_file_data_t *file = cpio_file_for_fd(fd);
+        size_t available;
+
+        if (file == NULL) {
+            /* Only the CPIO-backed descriptors have contents to map. */
+            errno = ENODEV;
+            return MAP_FAILED;
+        }
+        if (offset < 0 || (size_t)offset > file->size) {
+            errno = EINVAL;
+            return MAP_FAILED;
+        }
+
+        available = file->size - (size_t)offset;
+        if (available > length) {
+            available = length;
+        }
+
+        ptr = arena_alloc(rounded, MMAP_ALIGNMENT);
+        if (ptr == NULL) {
+            return MAP_FAILED;
+        }
+        memset(ptr, 0, rounded);
+        memcpy(ptr, file->start + offset, available);
+        return ptr;
     }
 
     ptr = arena_alloc(rounded, MMAP_ALIGNMENT);
@@ -334,10 +397,27 @@ void *__mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offse
     return mmap(addr, length, prot, flags, fd, offset);
 }
 
+/*
+ * Release a mapping when it is one this allocator handed out whole.
+ *
+ * Ruby's GC maps and unmaps heap pages continuously, so ignoring munmap entirely
+ * means the arena only ever shrinks: every page the collector releases is lost
+ * for the rest of the run.
+ *
+ * The caution that motivated ignoring it still applies, though. The GC also
+ * unmaps sub-ranges to trim a larger mapping down to alignment, and those
+ * addresses are not allocation pointers. free() distinguishes the two for us: it
+ * checks the header immediately below the pointer for this allocator's magic and
+ * ignores anything that does not match, so a trim request is dropped while a
+ * whole mapping is reclaimed.
+ */
 int munmap(void *addr, size_t length)
 {
-    (void)addr;
     (void)length;
+
+    if (addr != NULL) {
+        free(addr);
+    }
     return 0;
 }
 

@@ -90,6 +90,58 @@ static void fill_regular(struct stat *st, unsigned long size)
     st->st_blocks = (blkcnt_t)((size + 511) / 512);
 }
 
+static void fill_directory(struct stat *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_mode = S_IFDIR | S_IRUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
+    st->st_nlink = 2;
+    st->st_blksize = 4096;
+}
+
+/*
+ * Report whether any archive entry lives underneath `name`, which is what makes
+ * `name` a directory.
+ *
+ * The archive holds files only -- the generator lists regular files and nothing
+ * else -- so directories have to be inferred from entry names. Ruby depends on
+ * them existing: rb_realpath_internal walks a path one component at a time and
+ * stats each prefix, so requiring reline/version fails on the missing /reline
+ * long before the file itself is opened.
+ *
+ * cpio_get_entry restarts its scan on every call, so this is quadratic in the
+ * entry count. With an archive of a few dozen files that is irrelevant, and it
+ * keeps the lookup free of any state to invalidate.
+ */
+static int is_archive_directory(const char *name)
+{
+    size_t len;
+    int index;
+
+    if (name == NULL) {
+        return 0;
+    }
+
+    len = strlen(name);
+    if (len == 0) {
+        /* The archive root, reached as "/" or ".". */
+        return 1;
+    }
+
+    for (index = 0;; index++) {
+        const char *entry = NULL;
+        unsigned long size = 0;
+
+        if (cpio_get_entry(_cpio_archive, archive_len(), index, &entry, &size) == NULL) {
+            return 0;
+        }
+        /* Entry names are NUL terminated inside the archive, so indexing one past
+         * the compared prefix is safe. */
+        if (entry != NULL && strncmp(entry, name, len) == 0 && entry[len] == '/') {
+            return 1;
+        }
+    }
+}
+
 int open(const char *path, int flags, ...)
 {
     if (path == NULL) {
@@ -120,13 +172,17 @@ int stat(const char *__restrict path, struct stat *__restrict st)
         errno = EFAULT;
         return -1;
     }
-    if (find_file(path, &size) == NULL) {
-        errno = ENOENT;
-        return -1;
+    if (find_file(path, &size) != NULL) {
+        fill_regular(st, size);
+        return 0;
+    }
+    if (is_archive_directory(normalize_path(path))) {
+        fill_directory(st);
+        return 0;
     }
 
-    fill_regular(st, size);
-    return 0;
+    errno = ENOENT;
+    return -1;
 }
 
 /* No symbolic links exist in a CPIO archive read this way. */

@@ -23,8 +23,12 @@
 #include <sched.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
+
+#include <autoconf.h>
+#include <utils/util.h>
 
 /* musl may expose pthread_equal as a macro; the definition below needs the name. */
 #ifdef pthread_equal
@@ -33,9 +37,29 @@
 
 #define MAX_KEYS 16
 
+/* Must match ruby._stack_size in the assembly. */
+#define CONTROL_STACK_SIZE (1024u * 1024u)
+#define STACK_PAGE_SIZE 4096u
+
 static void *key_values[MAX_KEYS];
 static unsigned next_key;
-static char main_stack;
+
+/*
+ * The control thread's stack, as laid out by the generated camkes.c:
+ *
+ *     char _camkes_stack_<instance>_<n>_control[ROUND_UP(stack_size, 4K) + 4K * 2]
+ *
+ * with one guard page at each end, so the usable region starts one page in. The
+ * name carries the instance name, which ties this to `component Ruby ruby` in the
+ * assembly; renaming the instance requires updating it here.
+ *
+ * Ruby's GC scans the machine stack to find objects that live only in C locals,
+ * and get_stack() in thread_pthread.c asks for that range through
+ * pthread_getattr_np and pthread_attr_getstack. Reporting anything else makes the
+ * collector scan unrelated memory and reclaim objects that are still in use, with
+ * the damage surfacing much later as an object whose fields have been reused.
+ */
+extern char _camkes_stack_ruby_0_control[];
 
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(void *), void *arg)
 {
@@ -288,19 +312,20 @@ int pthread_attr_setstacksize(pthread_attr_t *attr, size_t size)
 }
 
 /*
- * CRuby inspects the current thread's stack to decide where to scan for GC roots
- * and how much recursion it can afford. Report the address of a component-local
- * object and the configured control thread stack size; there is only one stack,
- * so a single answer suffices.
+ * Report the control thread's stack, which is the one CRuby's GC has to scan.
+ *
+ * POSIX defines addr as the lowest address of the stack. get_stack() adds size
+ * back on to recover the top for a downward growing stack, so the two values have
+ * to be consistent with each other and with reality.
  */
 int pthread_attr_getstack(const pthread_attr_t *attr, void **addr, size_t *size)
 {
     (void)attr;
     if (addr != NULL) {
-        *addr = &main_stack;
+        *addr = _camkes_stack_ruby_0_control + STACK_PAGE_SIZE;
     }
     if (size != NULL) {
-        *size = 1024 * 1024;
+        *size = CONTROL_STACK_SIZE;
     }
     return 0;
 }

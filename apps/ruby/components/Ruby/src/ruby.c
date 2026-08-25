@@ -63,9 +63,26 @@ static char *read_script(const char *path)
 int run(void) {
   int state = 0;
   char *script;
+  /* Hand Ruby the bottom of this thread's stack before it allocates anything.
+   * ruby_init_stack() only records the address (vm.c:4622), but vm.c:4605 feeds it
+   * to ruby_thread_init_stack as the main thread's stack top, and that is the
+   * range the collector scans for objects held solely in C locals. The public
+   * header is explicit about the consequence of skipping it: "You must call this
+   * function before any heap allocation by Ruby implementation. Or GC will break
+   * living objects." */
+  RUBY_INIT_STACK;
 
   trace("CRuby initialize");
   ruby_init();
+
+  /* Register the statically linked encodings. process_options() does this at
+   * ruby.c:2496, ahead of its call to ruby_opt_init(), so the order here matches
+   * upstream. Without it Init_enc resolves to the do-nothing dummy in dmyenc.o
+   * -- dmyenc.c:11 notes that a statically linked ruby is meant to use the
+   * generated enc/encinit.c instead -- and Ruby then tries to load encodings as
+   * shared objects. */
+  extern void Init_enc(void);
+  Init_enc();
 
   /* Register the statically linked extensions. ruby_opt_init() does this at
    * ruby.c:1828 -- "load statically linked extensions before rubygems" -- and

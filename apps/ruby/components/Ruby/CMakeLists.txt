@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.16.0)
 
 project(ComponentRuby C)
 
-include(cpio)
 include(ExternalProject)
 include(ProcessorCount)
 
@@ -40,6 +39,15 @@ set(CRUBY_STATIC_LIB "${CRUBY_BUILD_DIR}/libruby-static.a")
 set(CRUBY_EXT_INIT_OBJ "${CRUBY_BUILD_DIR}/ext/extinit.o")
 set(CRUBY_EXT_CONSOLE_LIB "${CRUBY_BUILD_DIR}/ext/io/console/console.a")
 set(CRUBY_EXT_WAIT_LIB "${CRUBY_BUILD_DIR}/ext/io/wait/wait.a")
+
+# Encodings are static as well (ENCSTATIC = static), and the generated
+# enc/encinit.c provides the real Init_enc. libruby-static.a also carries
+# dmyenc.o, whose Init_enc does nothing; dmyenc.c:11 notes that a statically
+# linked ruby is supposed to use enc/encinit.c instead. Linking the generated
+# object is therefore what keeps the encodings from going unregistered.
+set(CRUBY_ENC_INIT_OBJ "${CRUBY_BUILD_DIR}/enc/encinit.o")
+set(CRUBY_ENC_LIB "${CRUBY_BUILD_DIR}/enc/libenc.a")
+set(CRUBY_TRANS_LIB "${CRUBY_BUILD_DIR}/enc/libtrans.a")
 
 
 ExternalProject_Add(
@@ -90,7 +98,10 @@ ExternalProject_Add(
             # exist in this sysroot. ext/Setup is no longer consulted in Ruby 4.0;
             # exts.mk is generated from configure's selection instead.
             --with-ext=io/console,io/wait
+    # common.mk:292 has main depend on both exts and libencs; building exts alone
+    # leaves the encodings unbuilt (common.mk:991).
     BUILD_COMMAND make -j${CRUBY_JOBS} exts
+    COMMAND make -j${CRUBY_JOBS} libencs
     COMMAND make -j${CRUBY_JOBS} libruby-static.a
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS
@@ -98,6 +109,9 @@ ExternalProject_Add(
       "${CRUBY_EXT_INIT_OBJ}"
       "${CRUBY_EXT_CONSOLE_LIB}"
       "${CRUBY_EXT_WAIT_LIB}"
+      "${CRUBY_ENC_INIT_OBJ}"
+      "${CRUBY_ENC_LIB}"
+      "${CRUBY_TRANS_LIB}"
     # Stream configure/build output instead of capturing it to log files. During
     # bring-up the failures are the point.
     USES_TERMINAL_DOWNLOAD TRUE
@@ -123,22 +137,47 @@ add_library(cruby_ext_wait STATIC IMPORTED GLOBAL)
 add_dependencies(cruby_ext_wait cruby_external)
 set_property(TARGET cruby_ext_wait PROPERTY IMPORTED_LOCATION "${CRUBY_EXT_WAIT_LIB}")
 
-# MakeCPIO emits archive.<name>.cpio, <name>.S and <name> into the build tree and
-# nothing into the source tree, so no generated embedding code is ever committed.
-# Its default symbol pair _cpio_archive/_cpio_archive_end is exactly what
-# libsel4muslcsys registers when LibSel4MuslcSysCPIOFS is enabled
-# (libsel4muslcsys/src/vsyscall.c:241-248), so no symbol name needs overriding.
+add_library(cruby_enc_init OBJECT IMPORTED GLOBAL)
+add_dependencies(cruby_enc_init cruby_external)
+set_property(TARGET cruby_enc_init PROPERTY IMPORTED_OBJECTS "${CRUBY_ENC_INIT_OBJ}")
+
+add_library(cruby_enc STATIC IMPORTED GLOBAL)
+add_dependencies(cruby_enc cruby_external)
+set_property(TARGET cruby_enc PROPERTY IMPORTED_LOCATION "${CRUBY_ENC_LIB}")
+
+add_library(cruby_trans STATIC IMPORTED GLOBAL)
+add_dependencies(cruby_trans cruby_external)
+set_property(TARGET cruby_trans PROPERTY IMPORTED_LOCATION "${CRUBY_TRANS_LIB}")
+
+# The archive carries both this repository's scripts and the Ruby library files
+# reline needs, because there is only one _cpio_archive symbol pair and
+# libsel4muslcsys registers exactly one archive.
 set(RUBY_SCRIPT_DIR "${CMAKE_CURRENT_LIST_DIR}/scripts")
+set(RUBY_ARCHIVE_STAGE "${CMAKE_CURRENT_BINARY_DIR}/archive-root")
+set(RUBY_ARCHIVE_CPIO "${CMAKE_CURRENT_BINARY_DIR}/ruby_archive.cpio")
+set(RUBY_ARCHIVE_ASM "${CMAKE_CURRENT_BINARY_DIR}/ruby_archive.S")
 set(RUBY_ARCHIVE_OBJ "${CMAKE_CURRENT_BINARY_DIR}/ruby_archive.o")
 
-MakeCPIO(ruby_archive.o "${RUBY_SCRIPT_DIR}/shell.rb")
+# Depends on cruby_external because rbconfig.rb is produced by CRuby's configure.
+add_custom_command(
+    OUTPUT "${RUBY_ARCHIVE_OBJ}"
+    COMMAND "${CMAKE_CURRENT_LIST_DIR}/make-archive.sh"
+            "${CRUBY_SRC_DIR}"
+            "${CRUBY_BUILD_DIR}"
+            "${RUBY_SCRIPT_DIR}"
+            "${RUBY_ARCHIVE_STAGE}"
+            "${RUBY_ARCHIVE_CPIO}"
+            "${RUBY_ARCHIVE_ASM}"
+            "${RUBY_ARCHIVE_OBJ}"
+            "${CMAKE_C_COMPILER}"
+    DEPENDS cruby_external "${RUBY_SCRIPT_DIR}/shell.rb"
+    BYPRODUCTS "${RUBY_ARCHIVE_CPIO}" "${RUBY_ARCHIVE_ASM}"
+    COMMENT "Generate embedded Ruby CPIO archive"
+    VERBATIM
+)
 
-# MakeCPIO declares an add_custom_command; something has to depend on its output
-# for the rule to run.
 add_custom_target(ruby_archive_gen DEPENDS "${RUBY_ARCHIVE_OBJ}")
 
-# Same pattern as cruby_static above, and as muslc_imported upstream: an IMPORTED
-# target can be named in LIBS, and add_dependencies gives CMake the ordering.
 add_library(ruby_archive OBJECT IMPORTED GLOBAL)
 add_dependencies(ruby_archive ruby_archive_gen)
 set_property(TARGET ruby_archive PROPERTY IMPORTED_OBJECTS "${RUBY_ARCHIVE_OBJ}")
@@ -150,6 +189,7 @@ DeclareCAmkESComponent(
     SOURCES
         src/ruby.c
         src/ruby_alloc.c
+        src/ruby_libc_init.c
         src/ruby_syscall_fs.c
         src/stub/ruby_pthread.c
         src/stub/ruby_syscall_clock.c
@@ -167,6 +207,11 @@ DeclareCAmkESComponent(
         cruby_ext_init
         cruby_ext_console
         cruby_ext_wait
+        # Same shape as the extensions: encinit.o pulls Init_big5 and friends out
+        # of the archives that follow it.
+        cruby_enc_init
+        cruby_enc
+        cruby_trans
         cruby_static
         ruby_archive
 )
