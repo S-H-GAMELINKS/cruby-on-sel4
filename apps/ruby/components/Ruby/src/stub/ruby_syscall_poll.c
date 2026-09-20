@@ -598,23 +598,27 @@ int fcntl(int fd, int cmd, ...)
  * non-zero, and everything else -- CPIO-backed files, the console -- is always
  * ready. Writes never block here, so POLLOUT is always granted.
  *
- * A positive timeout is treated as "wait indefinitely". There is no clock to
- * expire it against, and the only thing that can change readiness is serial
- * input, so the wait ends when a key arrives.
+ * Timeouts are real, and they have to be. Reline's inner_getc (ansi.rb:116-126)
+ * counts down in 10ms steps and gives up when the total is exhausted, which is
+ * how it tells a bare Escape from the start of a cursor-key sequence; a wait that
+ * only ever ends on a keypress would leave Escape pending until the next key.
+ * cursor_pos_internal likewise waits for the terminal to answer "\e[6n", and
+ * would hang against a console that never does.
  *
- * That approximation carries one real risk. cursor_pos_internal in
- * reline/io/ansi.rb writes "\e[6n" and waits for the terminal to report the
- * cursor position; since ruby_syscall_tty.c reports a tty, that path is live.
- * QEMU hands the console to the host's terminal, which answers, so the wait ends.
- * A console that never answers would hang here instead of timing out. Removing
- * the risk means giving these timeouts real expiry -- TimeServer is already in the
- * assembly for SerialServer, so a timer connection for this component is the
- * obvious route.
+ * TimeServer supplies the expiry. Both the serial and timer interfaces are
+ * readers on this component's global notification, so a single seL4_Wait catches
+ * either and the badge says which -- see get-notification.template.c.
  */
-static long poll_fds(struct pollfd *fds, unsigned long nfds, int blocking)
+#define RUBY_TIMER_ID 0
+
+/* Negative waits forever, zero does not wait, positive waits that many
+ * nanoseconds. */
+static long poll_fds(struct pollfd *fds, unsigned long nfds, int64_t timeout_ns)
 {
     unsigned long i;
     int watching_stdin = 0;
+    int armed = 0;
+    int expired = 0;
 
     if (fds == NULL && nfds != 0) {
         return -EFAULT;
@@ -628,6 +632,7 @@ static long poll_fds(struct pollfd *fds, unsigned long nfds, int blocking)
     }
 
     for (;;) {
+        seL4_Word badge = 0;
         int ready = 0;
 
         for (i = 0; i < nfds; i++) {
@@ -656,11 +661,32 @@ static long poll_fds(struct pollfd *fds, unsigned long nfds, int blocking)
             }
         }
 
-        if (ready > 0 || !blocking || !watching_stdin) {
+        if (ready > 0 || expired || timeout_ns == 0 || !watching_stdin) {
+            if (armed) {
+                /* Leaving a timer running would fire into the next wait. */
+                (void)timeout_stop(RUBY_TIMER_ID);
+            }
             return ready;
         }
 
-        seL4_Wait(stdin_getchar_notification(), NULL);
+        if (timeout_ns > 0 && !armed) {
+            if (timeout_oneshot_relative(RUBY_TIMER_ID, (uint64_t)timeout_ns) == 0) {
+                armed = 1;
+            } else {
+                /* No timer to wait on, so report the timeout immediately rather
+                 * than blocking for longer than asked. */
+                return 0;
+            }
+        }
+
+        seL4_Wait(stdin_getchar_notification(), &badge);
+
+        /* Readiness is rechecked before acting on expiry, so input that arrives
+         * in the same moment as the timer is not dropped. */
+        if (armed && (badge & timeout_notification_badge()) != 0) {
+            expired = 1;
+            armed = 0;
+        }
     }
 }
 
@@ -669,8 +695,15 @@ static long ruby_sys_poll(va_list ap)
     struct pollfd *fds = va_arg(ap, struct pollfd *);
     unsigned long nfds = va_arg(ap, unsigned long);
     int timeout_ms = va_arg(ap, int);
+    int64_t timeout_ns;
 
-    return poll_fds(fds, nfds, timeout_ms != 0);
+    if (timeout_ms < 0) {
+        timeout_ns = -1;
+    } else {
+        timeout_ns = (int64_t)timeout_ms * 1000000;
+    }
+
+    return poll_fds(fds, nfds, timeout_ns);
 }
 
 static long ruby_sys_ppoll(va_list ap)
@@ -678,11 +711,16 @@ static long ruby_sys_ppoll(va_list ap)
     struct pollfd *fds = va_arg(ap, struct pollfd *);
     unsigned long nfds = va_arg(ap, unsigned long);
     const struct timespec *timeout = va_arg(ap, const struct timespec *);
+    int64_t timeout_ns;
 
-    /* A NULL timeout means block; an all-zero one means do not. */
-    int blocking = timeout == NULL || timeout->tv_sec != 0 || timeout->tv_nsec != 0;
+    /* A NULL timeout means block. */
+    if (timeout == NULL) {
+        timeout_ns = -1;
+    } else {
+        timeout_ns = (int64_t)timeout->tv_sec * 1000000000 + timeout->tv_nsec;
+    }
 
-    return poll_fds(fds, nfds, blocking);
+    return poll_fds(fds, nfds, timeout_ns);
 }
 
 /* Runs after libsel4muslcsys has its own table in place. */

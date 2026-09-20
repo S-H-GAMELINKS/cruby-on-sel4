@@ -6,17 +6,19 @@ import <global-connectors.camkes>;
 component Ruby {
   control;
   uses GetChar stdin_getchar;
+  uses Timer timeout;
 }
 
 assembly {
   composition {
     component Ruby ruby;
-      component SerialServer serial;
+    component SerialServer serial;
     component TimeServer time_server;
 
     connection seL4RPCCall serial_time_server(from time_server.putchar, to serial.processed_putchar);
     connection seL4TimeServer serialserver_timer(from serial.timeout, to time_server.the_timer);
     connection seL4SerialServer stdin_input(from ruby.stdin_getchar, to serial.getchar);
+    connection seL4TimeServer ruby_timer(from ruby.timeout, to time_server.the_timer);
   }
 
   configuration {
