@@ -27,6 +27,8 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include "../console/console.h"
+
 /* Used until the terminal has been asked, and if it never answers. Matches
  * reline's own fallback, so behaviour is unchanged when measuring fails. */
 #define CONSOLE_ROWS 24
@@ -232,7 +234,18 @@ int ioctl(int fd, int request, ...)
             errno = EFAULT;
             return -1;
         }
-        if (fd == STDIN_FILENO && !console_size_known) {
+        /*
+         * The framebuffer console's size is known exactly, and it is the display
+         * that matters: it is a physical panel that cannot be resized, whereas a
+         * terminal on the other end of a serial line merely clips. When both
+         * exist the framebuffer wins, so that what is laid out fits the screen
+         * the presentation is actually shown on.
+         */
+        if (console_fb_available()) {
+            console_rows = (unsigned short)console_fb_rows();
+            console_cols = (unsigned short)console_fb_cols();
+            console_size_known = 1;
+        } else if (fd == STDIN_FILENO && !console_size_known) {
             measure_console();
         }
         ws->ws_row = console_rows;

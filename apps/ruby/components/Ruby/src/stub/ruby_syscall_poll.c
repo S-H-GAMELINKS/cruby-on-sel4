@@ -48,6 +48,7 @@
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/select.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -59,6 +60,11 @@
  * stdin_getchar_notification(), from the seL4SerialServer connection. */
 #include <camkes.h>
 #include <sel4/sel4.h>
+
+#include "../console/console.h"
+#include "ruby_ps2.h"
+#include "../xhci/hid.h"
+#include "../xhci/xhci.h"
 
 #define FAKE_EVENTFD_BASE 1000
 #define FAKE_EVENTFD_COUNT 4
@@ -345,6 +351,30 @@ static int serial_has_input(void)
 {
     volatile serial_ring_t *ring = serial_ring();
 
+    /* A reply the framebuffer console owes -- a cursor position report, say --
+     * arrives on standard input as far as the reader is concerned, so it counts
+     * as input for every readiness test. Otherwise poll would report nothing to
+     * read and the caller would block waiting for a key to produce an answer it
+     * already has. */
+    if (console_fb_reply_pending()) {
+        return 1;
+    }
+
+    /* The keyboard has no interrupt, so asking whether there is input is also
+     * what reads it off the controller. Every readiness test therefore has to go
+     * through here, which is the reason poll and readv both use this rather than
+     * looking at the ring directly. */
+    if (ps2_has_input()) {
+        return 1;
+    }
+
+    /* The USB controller has no interrupt either, so the same applies: asking
+     * whether there is input is what reads it off the hardware. */
+    xhci_poll();
+    if (hid_has_input()) {
+        return 1;
+    }
+
     return ring->head != ring->tail;
 }
 
@@ -411,8 +441,27 @@ static ssize_t serial_readv(const struct iovec *iov, int iovcnt)
         return 0;
     }
 
+    /* Replies come first and never block: the answer to a query the program has
+     * just written is already waiting, and blocking on the serial line ahead of
+     * it would deadlock a console that has no serial line at all. */
+    used += console_fb_take_reply(base, capacity);
+    if (used > 0) {
+        return (ssize_t)used;
+    }
+
+    used += ps2_take(base, capacity);
+    if (used > 0) {
+        return (ssize_t)used;
+    }
+
+    xhci_poll();
+    used += hid_take(base, capacity);
+    if (used > 0) {
+        return (ssize_t)used;
+    }
+
     base[used++] = serial_getchar();
-    while (used < capacity && serial_has_input()) {
+    while (used < capacity && serial_ring()->head != serial_ring()->tail) {
         base[used++] = serial_take();
     }
 
@@ -661,7 +710,15 @@ static long poll_fds(struct pollfd *fds, unsigned long nfds, int64_t timeout_ns)
             }
         }
 
-        if (ready > 0 || expired || timeout_ns == 0 || !watching_stdin) {
+        /*
+         * A wait with nothing to watch and no deadline could never end, so it
+         * reports nothing ready instead of blocking forever. A deadline alone is
+         * enough to wait on: the timer's notification arrives on the same object
+         * as the serial one, distinguished by badge, so the absence of stdin
+         * from the set does not leave this unwakeable.
+         */
+        if (ready > 0 || expired || timeout_ns == 0 ||
+            (!watching_stdin && timeout_ns < 0)) {
             if (armed) {
                 /* Leaving a timer running would fire into the next wait. */
                 (void)timeout_stop(RUBY_TIMER_ID);
@@ -688,6 +745,137 @@ static long poll_fds(struct pollfd *fds, unsigned long nfds, int64_t timeout_ns)
             armed = 0;
         }
     }
+}
+
+/*
+ * select, as poll with the descriptor sets turned inside out.
+ *
+ * Ruby reaches for it through IO.select, which is how a script waits for a key
+ * with a deadline -- a slide deck redrawing its clock while it waits for the
+ * next key is exactly that. The two calls answer the same question, so this
+ * translates rather than duplicating the waiting.
+ *
+ * The count returned is not poll's. select counts membership of the returned
+ * sets, so a descriptor that is both readable and writable counts twice.
+ */
+#define SELECT_MAX_FDS 64
+
+static long select_fds(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
+                       int64_t timeout_ns)
+{
+    struct pollfd fds[SELECT_MAX_FDS];
+    int count = 0;
+    long ready;
+    long bits = 0;
+
+    if (nfds < 0 || nfds > FD_SETSIZE) {
+        return -EINVAL;
+    }
+
+    for (int fd = 0; fd < nfds; fd++) {
+        short events = 0;
+
+        if (readfds != NULL && FD_ISSET(fd, readfds)) {
+            events |= POLLIN;
+        }
+        if (writefds != NULL && FD_ISSET(fd, writefds)) {
+            events |= POLLOUT;
+        }
+        if (exceptfds != NULL && FD_ISSET(fd, exceptfds)) {
+            events |= POLLPRI;
+        }
+        if (events == 0) {
+            continue;
+        }
+        /* The sets can name a thousand descriptors; nothing here opens enough
+         * for that to be a real limit, and refusing is better than silently
+         * watching only some of them. */
+        if (count == SELECT_MAX_FDS) {
+            return -EINVAL;
+        }
+
+        fds[count].fd = fd;
+        fds[count].events = events;
+        fds[count].revents = 0;
+        count++;
+    }
+
+    ready = poll_fds(fds, (unsigned long)count, timeout_ns);
+    if (ready < 0) {
+        return ready;
+    }
+
+    /* select reports through the sets it was given, so what was asked for has to
+     * be cleared before what is ready is written back. */
+    if (readfds != NULL) {
+        FD_ZERO(readfds);
+    }
+    if (writefds != NULL) {
+        FD_ZERO(writefds);
+    }
+    if (exceptfds != NULL) {
+        FD_ZERO(exceptfds);
+    }
+
+    for (int i = 0; i < count; i++) {
+        short revents = fds[i].revents;
+
+        /* A hangup or an error makes a descriptor readable as far as select is
+         * concerned: the read is what reports what happened. */
+        if (readfds != NULL && (revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+            FD_SET(fds[i].fd, readfds);
+            bits++;
+        }
+        if (writefds != NULL && (revents & POLLOUT) != 0) {
+            FD_SET(fds[i].fd, writefds);
+            bits++;
+        }
+        if (exceptfds != NULL && (revents & POLLPRI) != 0) {
+            FD_SET(fds[i].fd, exceptfds);
+            bits++;
+        }
+    }
+
+    return bits;
+}
+
+static long ruby_sys_select(va_list ap)
+{
+    int nfds = va_arg(ap, int);
+    fd_set *readfds = va_arg(ap, fd_set *);
+    fd_set *writefds = va_arg(ap, fd_set *);
+    fd_set *exceptfds = va_arg(ap, fd_set *);
+    struct timeval *timeout = va_arg(ap, struct timeval *);
+    int64_t timeout_ns;
+
+    /* A NULL timeout means block. */
+    if (timeout == NULL) {
+        timeout_ns = -1;
+    } else {
+        timeout_ns = (int64_t)timeout->tv_sec * 1000000000 + (int64_t)timeout->tv_usec * 1000;
+    }
+
+    return select_fds(nfds, readfds, writefds, exceptfds, timeout_ns);
+}
+
+static long ruby_sys_pselect6(va_list ap)
+{
+    int nfds = va_arg(ap, int);
+    fd_set *readfds = va_arg(ap, fd_set *);
+    fd_set *writefds = va_arg(ap, fd_set *);
+    fd_set *exceptfds = va_arg(ap, fd_set *);
+    const struct timespec *timeout = va_arg(ap, const struct timespec *);
+    int64_t timeout_ns;
+
+    /* The signal mask argument is ignored: nothing here delivers signals, so
+     * there is no window to block them over. */
+    if (timeout == NULL) {
+        timeout_ns = -1;
+    } else {
+        timeout_ns = (int64_t)timeout->tv_sec * 1000000000 + timeout->tv_nsec;
+    }
+
+    return select_fds(nfds, readfds, writefds, exceptfds, timeout_ns);
 }
 
 static long ruby_sys_poll(va_list ap)
@@ -731,5 +919,11 @@ static void CONSTRUCTOR(MUSLCSYS_WITH_VSYSCALL_PRIORITY + 1) install_ruby_poll(v
 #endif
 #ifdef __NR_ppoll
     muslcsys_install_syscall(__NR_ppoll, ruby_sys_ppoll);
+#endif
+#ifdef __NR_select
+    muslcsys_install_syscall(__NR_select, ruby_sys_select);
+#endif
+#ifdef __NR_pselect6
+    muslcsys_install_syscall(__NR_pselect6, ruby_sys_pselect6);
 #endif
 }

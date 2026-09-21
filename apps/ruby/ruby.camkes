@@ -3,10 +3,129 @@ import <SerialServer/SerialServer.camkes>;
 import <TimeServer/TimeServer.camkes>;
 import <global-connectors.camkes>;
 
+/*
+ * The framebuffer GRUB set up before entering the kernel.
+ *
+ * Its address and geometry cannot be discovered from inside a component: seL4
+ * reports them in an extended bootinfo header, but bootinfo is not available
+ * here, and a mapping has to exist in the capDL specification before the system
+ * starts. So they are written down, and the kernel's own boot message is where
+ * they are read off:
+ *
+ *   Got framebuffer info in multiboot2. Current video mode is at physical
+ *   address=80000000 pitch=5120 resolution=1280x800@32 type=1
+ *
+ * The values below are what QEMU with OVMF reports for the mode grub.cfg asks
+ * for. The Steam Deck will report its own, and they go here.
+ */
+component Framebuffer {
+  hardware;
+  /* The size here and framebuffer.mem_size below have to be the same number;
+   * the generated connector asserts that they are. */
+  dataport Buf(0x800000) mem;
+}
+
+/*
+ * The legacy keyboard controller at ports 0x60 and 0x64.
+ *
+ * The Steam Deck has no such device. What it may have is firmware that pretends
+ * to: USB legacy emulation traps access to these ports and answers on behalf of
+ * a USB keyboard, which is how a machine with no PS/2 port runs software that
+ * only knows about one. Whether this firmware still does that is what this is
+ * here to find out -- reading the status port answers 0xff when nothing is
+ * listening.
+ *
+ * It would not reach the Deck's own buttons in any case: those are a USB HID
+ * device on the internal xHCI controller, and legacy emulation covers keyboards
+ * and mice. A keyboard or a presentation clicker in the dock is what this can
+ * serve.
+ */
+component Keyboard {
+  hardware;
+  provides IOPort port;
+}
+
+/*
+ * PCI configuration space, through the address and data ports.
+ *
+ * This is how the USB controller is found: its registers are wherever the
+ * firmware put them, and nothing but its own base address register knows where
+ * that is. It is also how the controller is allowed to fetch the data structures
+ * it is given, which does not happen until bus mastering is turned on.
+ */
+component PCIConfig {
+  hardware;
+  provides IOPort port;
+}
+
+/*
+ * The USB host controller's registers.
+ *
+ * Where they are is the firmware's decision and is read from the controller's
+ * base address register, but a component's mappings are fixed before the system
+ * starts, so the answer has to be written down here. The startup message says
+ * what the machine reported; when the two disagree, nothing works and the
+ * capability version register reads as ones.
+ */
+component XHCI {
+  hardware;
+  dataport Buf(0x10000) mmio;
+}
+
+/*
+ * Further windows, for the other controllers and the other machine.
+ *
+ * A machine may have several USB controllers with different things wired to
+ * each, and the addresses differ between the Steam Deck and the QEMU it is
+ * developed against. Rather than editing an address for every change of machine
+ * or of guess -- which is the one thing that has to be right before anything
+ * else can be tested -- every candidate is mapped and the driver walks the lot.
+ * Registers with nothing behind them read as ones, so a window that leads
+ * nowhere costs a single read to rule out.
+ */
+component XHCIAlt {
+  hardware;
+  dataport Buf(0x10000) mmio;
+}
+
+component XHCIQemu {
+  hardware;
+  dataport Buf(0x10000) mmio;
+}
+
 component Ruby {
   control;
   uses GetChar stdin_getchar;
   uses Timer timeout;
+  uses IOPort keyboard;
+  uses IOPort pci_config;
+  dataport Buf(0x10000) xhci;
+  dataport Buf(0x10000) xhci_alt;
+  dataport Buf(0x10000) xhci_qemu;
+  dataport Buf(0x800000) fb;
+
+  /* Geometry of the framebuffer above, so the console can address it without
+   * having to rediscover what the assembly already states. */
+  attribute int fb_width;
+  attribute int fb_height;
+  attribute int fb_pitch;
+  /* Integer magnification of the 8x16 font. At 2 a 1280x800 panel is 80x25,
+   * which is a normal terminal and legible from across a room; at 1 it is
+   * 160x50, which is more screen but only readable up close. */
+  attribute int fb_scale;
+
+  /*
+   * How far to turn what is drawn, clockwise, in degrees: 0, 90, 180 or 270.
+   *
+   * A panel need not face the way its framebuffer is laid out. The Steam Deck's
+   * is an 800x1280 portrait panel mounted in a landscape body with its top edge
+   * along the left side, so anything drawn straight comes out lying on its side
+   * -- which is what the GRUB menu does, since GRUB knows nothing of this.
+   */
+  attribute int fb_rotate;
+
+  /* The script run at startup, as a path inside the embedded CPIO archive. */
+  attribute string entry_script;
 }
 
 assembly {
@@ -14,16 +133,101 @@ assembly {
     component Ruby ruby;
     component SerialServer serial;
     component TimeServer time_server;
+    component Framebuffer framebuffer;
+    component Keyboard keyboard;
+    component PCIConfig pci_config;
+    component XHCI xhci;
+    component XHCIAlt xhci_alt;
+    component XHCIQemu xhci_qemu;
 
     connection seL4RPCCall serial_time_server(from time_server.putchar, to serial.processed_putchar);
     connection seL4TimeServer serialserver_timer(from serial.timeout, to time_server.the_timer);
     connection seL4SerialServer stdin_input(from ruby.stdin_getchar, to serial.getchar);
     connection seL4TimeServer ruby_timer(from ruby.timeout, to time_server.the_timer);
+    connection seL4HardwareMMIO ruby_framebuffer(from ruby.fb, to framebuffer.mem);
+    connection seL4HardwareIOPort ruby_keyboard(from ruby.keyboard, to keyboard.port);
+    connection seL4HardwareIOPort ruby_pci(from ruby.pci_config, to pci_config.port);
+    connection seL4HardwareMMIO ruby_xhci(from ruby.xhci, to xhci.mmio);
+    connection seL4HardwareMMIO ruby_xhci_alt(from ruby.xhci_alt, to xhci_alt.mmio);
+    connection seL4HardwareMMIO ruby_xhci_qemu(from ruby.xhci_qemu, to xhci_qemu.mmio);
   }
 
   configuration {
     ruby._stack_size = 1024 * 1024;
     ruby.stdin_getchar_shmem_size = 0x1000;
     time_server.timers_per_client = 1;
+
+    /*
+     * The Steam Deck's framebuffer, as its firmware allocates it in the GPU's
+     * memory aperture. The address does not change with the mode -- it is the
+     * same whether the internal panel or an external display is being driven --
+     * so only the shape below has to follow what is attached.
+     *
+     * 8 MiB covers either: 7680 * 1080 for a 1080p external display is
+     * 0x7e9000, and 3200 * 1280 for the panel is 0x3e8000. The address is
+     * 256 MiB aligned, which lets the mapping use large pages.
+     *
+     * It also sits above the kernel window: PADDR_TOP on x86_64 is 510 GiB and
+     * this is at 995. That is allowed -- device memory is never mapped into the
+     * window, and the kernel makes untypeds for it up to
+     * CONFIG_PADDR_USER_DEVICE_TOP, which is 128 TiB -- but it is territory
+     * nothing here has been through before. If the loader cannot find a device
+     * frame at this address, this is the first place to look.
+     *
+     * For QEMU with OVMF, in the mode grub.cfg asks for:
+     *     framebuffer.mem_paddr = 0x80000000;
+     *     ruby.fb_width = 1280; ruby.fb_height = 800;
+     *     ruby.fb_pitch = 5120; ruby.fb_rotate = 0;
+     *
+     * The shape has to match whatever the firmware set, and the firmware
+     * follows what is plugged in. Getting it wrong is easy to recognise: a
+     * pitch that is too large walks down the screen faster than the rows do,
+     * and the picture shears into diagonal noise with fragments of text in it.
+     */
+    framebuffer.mem_paddr = 0xf8e0000000;
+    framebuffer.mem_size = 0x800000;
+
+    /*
+     * An external 1080p display, which is what a presentation runs on and what
+     * the Deck's firmware drives to the exclusion of its own panel once one is
+     * connected. It is mounted the way its framebuffer is laid out, so nothing
+     * is turned. At twice the font's size this is a 120x33 console.
+     *
+     * For the Deck's own panel, with nothing plugged in:
+     *     ruby.fb_width = 800; ruby.fb_height = 1280;
+     *     ruby.fb_pitch = 3200; ruby.fb_rotate = 90;
+     */
+    ruby.fb_width = 1920;
+    ruby.fb_height = 1080;
+    ruby.fb_pitch = 7680;
+    ruby.fb_scale = 2;
+    ruby.fb_rotate = 0;
+
+    /* "/shell.rb" for the Reline REPL, "/slides.rb" for the presentation. */
+    /* Data at 0x60, status and command at 0x64. The range is inclusive of the
+     * first and exclusive of the last, so this covers both. */
+    keyboard.port_attributes = "0x60:0x65";
+
+    /* Address at 0xcf8, data at 0xcfc, both 32 bits wide. */
+    pci_config.port_attributes = "0xcf8:0xd00";
+
+    /* The Steam Deck has two, an AMD 1022:162c pair. */
+    xhci.mmio_paddr = 0x80200000;
+    xhci.mmio_size = 0x10000;
+    xhci_alt.mmio_paddr = 0x80300000;
+    xhci_alt.mmio_size = 0x10000;
+
+    /* QEMU's, a Red Hat 1b36:000d. */
+    xhci_qemu.mmio_paddr = 0x800000000;
+    xhci_qemu.mmio_size = 0x10000;
+
+    /*
+     * Rings and contexts for the USB controller, which fetches them itself and
+     * so needs to be told where they are in physical memory. Everything the
+     * driver allocates comes from here.
+     */
+    ruby.dma_pool = 0x40000;
+
+    ruby.entry_script = "/slides.rb";
   }
 }

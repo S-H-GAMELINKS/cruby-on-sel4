@@ -155,6 +155,12 @@ set_property(TARGET cruby_trans PROPERTY IMPORTED_LOCATION "${CRUBY_TRANS_LIB}")
 set(RUBY_SCRIPT_DIR "${CMAKE_CURRENT_LIST_DIR}/scripts")
 set(RUBY_ARCHIVE_STAGE "${CMAKE_CURRENT_BINARY_DIR}/archive-root")
 set(RUBY_ARCHIVE_CPIO "${CMAKE_CURRENT_BINARY_DIR}/ruby_archive.cpio")
+# Everything under scripts/ goes into the archive, so a change to any of it has
+# to rebuild. CONFIGURE_DEPENDS re-runs the glob when the directory changes,
+# which is what makes a newly added script or deck picked up without a manual
+# CMake run.
+file(GLOB RUBY_SCRIPT_FILES CONFIGURE_DEPENDS "${RUBY_SCRIPT_DIR}/*")
+
 set(RUBY_ARCHIVE_ASM "${CMAKE_CURRENT_BINARY_DIR}/ruby_archive.S")
 set(RUBY_ARCHIVE_OBJ "${CMAKE_CURRENT_BINARY_DIR}/ruby_archive.o")
 
@@ -170,7 +176,7 @@ add_custom_command(
             "${RUBY_ARCHIVE_ASM}"
             "${RUBY_ARCHIVE_OBJ}"
             "${CMAKE_C_COMPILER}"
-    DEPENDS cruby_external "${RUBY_SCRIPT_DIR}/shell.rb"
+    DEPENDS cruby_external ${RUBY_SCRIPT_FILES}
     BYPRODUCTS "${RUBY_ARCHIVE_CPIO}" "${RUBY_ARCHIVE_ASM}"
     COMMENT "Generate embedded Ruby CPIO archive"
     VERBATIM
@@ -191,8 +197,16 @@ DeclareCAmkESComponent(
         src/ruby_alloc.c
         src/ruby_libc_init.c
         src/ruby_syscall_fs.c
+        src/console/fb_console.c
+        src/console/font_8x16.c
+        src/console/font_misaki.c
+        src/xhci/hid.c
+        src/xhci/pci.c
+        src/xhci/xhci.c
+        src/stub/ruby_ps2.c
         src/stub/ruby_pthread.c
         src/stub/ruby_syscall_clock.c
+        src/stub/ruby_syscall_console.c
         src/stub/ruby_syscall_poll.c
         src/stub/ruby_syscall_proc.c
         src/stub/ruby_syscall_random.c

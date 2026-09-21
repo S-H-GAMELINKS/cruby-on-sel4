@@ -15,6 +15,8 @@
 #include <errno.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -34,15 +36,39 @@ int prctl(int option, ...)
  * There is a single flat namespace with no notion of a current directory. Root is
  * the only answer that keeps path handling coherent.
  */
+/*
+ * There is one directory and it is the root of the CPIO archive.
+ *
+ * A NULL buffer has to be answered rather than refused. It is the GNU extension
+ * where getcwd allocates what it returns, musl implements it, and CRuby's
+ * ruby_getcwd uses it -- so refusing it turns every relative path into
+ * Errno::ERANGE, which is what `load './slides.rb'` failed with.
+ */
 char *getcwd(char *buf, size_t size)
 {
-    if (buf == NULL || size < 2) {
+    static const char cwd[] = "/";
+
+    if (buf == NULL) {
+        /* The caller owns the result and frees it, exactly as with strdup. */
+        buf = malloc(sizeof(cwd));
+        if (buf == NULL) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        memcpy(buf, cwd, sizeof(cwd));
+        return buf;
+    }
+
+    if (size == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (size < sizeof(cwd)) {
         errno = ERANGE;
         return NULL;
     }
 
-    buf[0] = '/';
-    buf[1] = '\0';
+    memcpy(buf, cwd, sizeof(cwd));
     return buf;
 }
 

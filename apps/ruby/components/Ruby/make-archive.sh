@@ -19,8 +19,10 @@ cc=$8
 rm -rf "$stage"
 mkdir -p "$stage"
 
-# Scripts owned by this repository.
-cp "$script_dir"/*.rb "$stage/"
+# Everything this repository puts in the archive: scripts, and the data they
+# read. The slide deck is a file the presentation tool opens at run time, so it
+# has to travel with it -- there is no filesystem to put it on later.
+cp "$script_dir"/* "$stage/"
 
 # reline ships as a bundled gem, and its lib directory is already laid out the
 # way require expects. The version is globbed rather than pinned so that a CRuby
