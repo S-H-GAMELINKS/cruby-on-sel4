@@ -261,7 +261,7 @@ def title_slide_title_row
   clamp((SCREEN_H - title_block_rows) / 2, 3, [SCREEN_H - title_block_rows - 2, 3].max)
 end
 
-Slide = Struct.new(:title, :subtitle, :bullets, :code, :notes, :layout, keyword_init: true)
+Slide = Struct.new(:title, :subtitle, :bullets, :code, :image, :notes, :layout, keyword_init: true)
 
 # ---------------------------------------------------------------------------
 # Input
@@ -335,13 +335,30 @@ def parse_code_directive(line)
   code_excerpt(m[1], start_line: m[2].to_i, lines: m[3].to_i)
 end
 
+# The width and height of a binary PPM, from its header alone. Comments are
+# dropped before matching, which may also eat into the samples that follow the
+# header, but only the header is looked at.
+def ppm_size(path)
+  header = File.open(path, 'rb') { |f| f.read(256) }.to_s.b
+  m = header.gsub(/#[^\n]*/n, '').match(/\AP6\s+(\d+)\s+(\d+)/n)
+  m && [m[1].to_i, m[2].to_i]
+rescue StandardError
+  nil
+end
+
+def parse_image_directive(line)
+  m = line.match(/\A\{\{image:(.+?)\}\}\z/)
+  m && m[1]
+end
+
 def expand_line_breaks(text)
   text.to_s.gsub(%r{<br\s*/?>}i, "\n").gsub('\\n', "\n")
 end
 
 def parse_markdown(text)
   text.split(/^---+\s*$/).filter_map do |chunk|
-    slide = Slide.new(title: nil, subtitle: nil, bullets: [], code: [], notes: nil, layout: 'default')
+    slide = Slide.new(title: nil, subtitle: nil, bullets: [], code: [], image: nil, notes: nil,
+                      layout: 'default')
     in_code = false
     code_lines = []
 
@@ -371,8 +388,13 @@ def parse_markdown(text)
         note = stripped[2..]
         slide.notes = slide.notes ? "#{slide.notes}  #{note}" : note
       else
-        code = parse_code_directive(stripped)
-        slide.code.concat(code) if code
+        image = parse_image_directive(stripped)
+        if image
+          slide.image = image
+        else
+          code = parse_code_directive(stripped)
+          slide.code.concat(code) if code
+        end
       end
     end
 
@@ -497,6 +519,25 @@ def render_code(lines, start_row)
   row
 end
 
+# An image is drawn by the console itself, from the archive: this only says
+# where. One image pixel is one console pixel before scaling, so a cell is 8x16
+# of them, and the image is centred on that.
+def render_image(path, start_row)
+  return start_row unless path
+
+  size = ppm_size(path)
+  unless size
+    write_at(start_row, content_col, fit("image not embedded: #{path}", content_w), 0, '31')
+    return start_row + 1
+  end
+
+  cols = (size[0] + 7) / 8
+  rows = (size[1] + 15) / 16
+  at(start_row, [((SCREEN_W - cols) / 2) + 1, 1].max)
+  $stdout.syswrite("\x1b_img;#{path}\x1b\\")
+  start_row + rows
+end
+
 def render_footer(text)
   return unless text
   mode = text_width(text) <= body_text_w ? 1 : 0
@@ -556,7 +597,8 @@ def render_slide(slide, index, total, remaining)
     render_header(index, total, remaining)
     render_title(slide.title, slide.subtitle)
     row = render_bullets(slide.bullets, body_start_row(!slide.subtitle.nil?))
-    render_code(slide.code, row + 1)
+    row = render_code(slide.code, row + 1)
+    render_image(slide.image, row + 1)
     render_footer(slide.notes || 'Right/Space next  Left/Back prev  q quit')
   end
 end

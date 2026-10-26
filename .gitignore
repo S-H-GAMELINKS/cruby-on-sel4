@@ -6,4 +6,6 @@
 /build-*/
 /CMakeFiles/
 /CMakeCache.txt
+apps/ruby/components/Ruby/images
+apps/ruby/components/Ruby/scripts/*.ppm
 apps/ruby/components/Ruby/scripts/slides.md

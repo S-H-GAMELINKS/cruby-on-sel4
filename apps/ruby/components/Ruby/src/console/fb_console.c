@@ -38,6 +38,12 @@
 #include <string.h>
 
 #include <camkes.h>
+#include <cpio/cpio.h>
+
+/* Emitted by make-archive.sh. Images are read straight out of the archive rather
+ * than through open(), so drawing one copies nothing and allocates nothing. */
+extern char _cpio_archive[];
+extern char _cpio_archive_end[];
 
 /* Bounds for the statically allocated shadow buffers. Large enough for 1920x1080
  * unscaled; a mode past this renders the part that fits and ignores the rest,
@@ -72,6 +78,17 @@
  * from its leftmost cell, and the two move together. */
 #define CELL_TAIL 0x01u
 
+/*
+ * A cell an image has been drawn over. Its pixels belong to the image, so a
+ * repaint leaves them alone; writing to the cell clears the flag like any other,
+ * and the cell comparison then sees a change and paints over the image.
+ */
+#define CELL_IMAGE 0x02u
+
+/* Longest string sequence kept for interpretation. Anything longer is not one
+ * this understands, and is discarded like the rest. */
+#define MAX_STRING 128
+
 /* Largest magnification ESC [ n z can select, and so the most rows a single line
  * of text can cover. */
 #define MAX_MAGNIFY 4
@@ -98,7 +115,7 @@ enum parse_state {
     STATE_GROUND,
     STATE_ESCAPE,
     STATE_CSI,
-    STATE_STRING,       /* OSC and friends, discarded up to their terminator */
+    STATE_STRING,       /* OSC and friends; only APC is acted on */
     STATE_STRING_ESC,
 };
 
@@ -161,6 +178,17 @@ static struct {
     int nparams;
     int have_param;
     char private;
+
+    /* The string sequence being read: the byte that introduced it, and its body
+     * so far. An overlong body is marked rather than cut short, so that a
+     * truncated path is never taken for a real one. */
+    char string_kind;
+    char string[MAX_STRING];
+    size_t string_len;
+    int string_overflow;
+
+    /* Whether any cell carries CELL_IMAGE, so a scroll knows to deal with it. */
+    int image_shown;
 
     int ready;
     int usable;
@@ -508,6 +536,13 @@ static void draw_glyph(int row, int col, int span, int rows_tall, int cursor)
     int pixels_x;
     int pixels_y;
 
+    /* Covered by an image. A repaint here would be the cursor passing over or a
+     * neighbouring row changing height, neither of which should cut a hole in
+     * it. */
+    if ((cell->flags & CELL_IMAGE) != 0) {
+        return;
+    }
+
     if (cursor) {
         uint32_t swap = fg;
 
@@ -731,6 +766,22 @@ static void scroll_up(void)
     memmove(&cells[0][0], &cells[1][0], (size_t)(con.rows - 1) * sizeof(cells[0]));
     memmove(&row_magnify[0], &row_magnify[1], (size_t)(con.rows - 1) * sizeof(row_magnify[0]));
     clear_row(con.rows - 1);
+
+    /*
+     * An image does not scroll: its pixels stay where they were drawn while the
+     * cells that marked them move up. Rather than leave it behind, partly
+     * repainted, it goes, and the whole screen is painted from the cells.
+     */
+    if (con.image_shown) {
+        for (int r = 0; r < con.rows; r++) {
+            for (int c = 0; c < con.cols; c++) {
+                cells[r][c].flags &= (uint8_t)~CELL_IMAGE;
+            }
+        }
+        con.image_shown = 0;
+        invalidate_rows(0, con.rows);
+        return;
+    }
 
     /*
      * Rows of ordinary height need no help: their cells moved, and comparing
@@ -1213,6 +1264,175 @@ static void put_ground(char c)
     }
 }
 
+/*
+ * Read one number from a PPM header, skipping the whitespace and comments
+ * before it. Returns -1 when there is no number to read.
+ */
+static long ppm_number(const uint8_t **p, const uint8_t *end)
+{
+    long value = 0;
+    int digits = 0;
+
+    while (*p < end) {
+        uint8_t ch = **p;
+
+        if (ch == '#') {
+            while (*p < end && **p != '\n') {
+                (*p)++;
+            }
+        } else if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+            (*p)++;
+        } else {
+            break;
+        }
+    }
+
+    while (*p < end && **p >= '0' && **p <= '9') {
+        if (value > 0xffffff) {
+            return -1;
+        }
+        value = value * 10 + (**p - '0');
+        (*p)++;
+        digits++;
+    }
+
+    return digits > 0 ? value : -1;
+}
+
+/*
+ * Draw a binary PPM (P6) from the archive with its top left corner at the
+ * cursor.
+ *
+ * One pixel of the image is one pixel of the console before scaling, so a cell
+ * is 8x16 of them, the same as a glyph of the base font. That keeps an image the
+ * same size relative to the text on every machine, whatever fb_scale is.
+ *
+ * PPM rather than anything compressed because there is no decoder here and no
+ * need for one: the archive is in memory already, and the samples can be copied
+ * to the screen as they are. The cursor does not move, so whatever is written
+ * next decides where the text continues.
+ */
+static void draw_image(const char *path)
+{
+    const uint8_t *data;
+    const uint8_t *p;
+    const uint8_t *end;
+    unsigned long size = 0;
+    long width;
+    long height;
+    long maxval;
+    int scale = con.scale;
+    int cell_w = CONSOLE_FONT_WIDTH * scale;
+    int cell_h = CONSOLE_FONT_HEIGHT * scale;
+    int left = con.col * cell_w;
+    int top = con.row * cell_h;
+    long visible_w;
+    long visible_h;
+    int last_col;
+    int last_row;
+
+    while (path[0] == '/') {
+        path++;
+    }
+
+    data = cpio_get_file(_cpio_archive, (unsigned long)(_cpio_archive_end - _cpio_archive),
+                         path, &size);
+    if (data == NULL || size < 2 || data[0] != 'P' || data[1] != '6') {
+        return;
+    }
+
+    p = data + 2;
+    end = data + size;
+    width = ppm_number(&p, end);
+    height = ppm_number(&p, end);
+    maxval = ppm_number(&p, end);
+    /* Exactly one whitespace byte separates the header from the samples. */
+    if (width <= 0 || height <= 0 || maxval <= 0 || maxval > 255 || p >= end) {
+        return;
+    }
+    p++;
+    if ((unsigned long)(end - p) < (unsigned long)width * (unsigned long)height * 3) {
+        return;
+    }
+
+    /* Clipped to the terminal, which leaves the status row alone. */
+    visible_w = (con.cols * cell_w - left) / scale;
+    visible_h = (con.rows * cell_h - top) / scale;
+    if (visible_w > width) {
+        visible_w = width;
+    }
+    if (visible_h > height) {
+        visible_h = height;
+    }
+    if (visible_w <= 0 || visible_h <= 0) {
+        return;
+    }
+
+    /* Whatever is pending goes out first, so that nothing still waiting to be
+     * drawn underneath the image is drawn over it afterwards. */
+    console_flush();
+
+    for (long iy = 0; iy < visible_h; iy++) {
+        const uint8_t *src = p + iy * width * 3;
+
+        for (int ry = 0; ry < scale; ry++) {
+            volatile uint32_t *out = pixel_at(left, top + (int)iy * scale + ry);
+
+            for (long ix = 0; ix < visible_w; ix++) {
+                uint32_t r = src[ix * 3] * 255u / (uint32_t)maxval;
+                uint32_t g = src[ix * 3 + 1] * 255u / (uint32_t)maxval;
+                uint32_t b = src[ix * 3 + 2] * 255u / (uint32_t)maxval;
+                uint32_t colour = (r << 16) | (g << 8) | b;
+
+                for (int rx = 0; rx < scale; rx++) {
+                    *out = colour;
+                    out += con.step_x;
+                }
+            }
+        }
+    }
+
+    /* A cell only partly covered still counts as the image's: repainting it
+     * would cut a strip off the edge. */
+    last_col = (int)((left + visible_w * scale - 1) / cell_w);
+    last_row = (int)((top + visible_h * scale - 1) / cell_h);
+    for (int r = con.row; r <= last_row; r++) {
+        for (int c = con.col; c <= last_col; c++) {
+            cells[r][c].flags |= CELL_IMAGE;
+            shadow[r][c] = cells[r][c];
+        }
+    }
+    con.image_shown = 1;
+}
+
+/*
+ * A completed string sequence.
+ *
+ * Only APC is interpreted, and only as ESC _ img;<path> ESC \. APC is the one
+ * kind no terminal in use gives a meaning to, so the same bytes reaching the
+ * serial console are ignored there instead of being taken for something else.
+ */
+static void string_done(void)
+{
+    if (con.string_kind != '_' || con.string_overflow) {
+        return;
+    }
+
+    con.string[con.string_len] = '\0';
+    if (strncmp(con.string, "img;", 4) == 0) {
+        draw_image(con.string + 4);
+    }
+}
+
+static void put_string(char c)
+{
+    if (con.string_len + 1 < sizeof(con.string)) {
+        con.string[con.string_len++] = c;
+    } else {
+        con.string_overflow = 1;
+    }
+}
+
 static void put_escape(char c)
 {
     switch (c) {
@@ -1228,6 +1448,9 @@ static void put_escape(char c)
     case '^':
     case '_':
         con.state = STATE_STRING;
+        con.string_kind = c;
+        con.string_len = 0;
+        con.string_overflow = 0;
         break;
     case '7':
         con.saved_row = con.row;
@@ -1315,16 +1538,23 @@ void console_fb_write(const char *buf, size_t len)
             put_csi(c);
             break;
         case STATE_STRING:
-            /* A string sequence ends at BEL or at ESC \, and nothing here acts on
-             * one, so only its extent matters. */
+            /* A string sequence ends at BEL or at ESC \. */
             if (c == '\a') {
                 con.state = STATE_GROUND;
+                string_done();
             } else if (c == '\033') {
                 con.state = STATE_STRING_ESC;
+            } else {
+                put_string(c);
             }
             break;
         case STATE_STRING_ESC:
-            con.state = c == '\\' ? STATE_GROUND : STATE_STRING;
+            if (c == '\\') {
+                con.state = STATE_GROUND;
+                string_done();
+            } else {
+                con.state = STATE_STRING;
+            }
             break;
         }
     }
