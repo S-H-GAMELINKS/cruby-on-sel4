@@ -60,6 +60,14 @@
 #define DEFAULT_FG 7
 #define DEFAULT_BG 0
 
+/*
+ * The status row's colours. The background matches the screen's so that an empty
+ * one is invisible: nothing should be shown there unless something has gone
+ * wrong, and a bar across the bottom of a presentation is something.
+ */
+#define STATUS_FG 6
+#define STATUS_BG 0
+
 /* A cell that a character to its left extends over. The character is drawn once,
  * from its leftmost cell, and the two move together. */
 #define CELL_TAIL 0x01u
@@ -316,6 +324,19 @@ static void console_init(void)
         shadow_magnify[r] = 1;
     }
 
+    /*
+     * The status row is not one of the terminal's, so clearing the screen never
+     * reaches it -- including the clear that happens here. Left alone it would
+     * keep showing whatever the boot loader drew there.
+     */
+    for (int c = 0; c < con.cols; c++) {
+        cells[con.rows][c].ch = ' ';
+        cells[con.rows][c].fg = STATUS_FG;
+        cells[con.rows][c].bg = STATUS_BG;
+        cells[con.rows][c].flags = 0;
+        cells[con.rows][c].span = 1;
+    }
+
     con.usable = 1;
 }
 
@@ -556,8 +577,8 @@ void console_fb_set_status(const char *text)
         if (ch == '\0') {
             for (int rest = c; rest < con.cols; rest++) {
                 cells[row][rest].ch = ' ';
-                cells[row][rest].fg = 0;
-                cells[row][rest].bg = 6;
+                cells[row][rest].fg = STATUS_FG;
+                cells[row][rest].bg = STATUS_BG;
                 cells[row][rest].flags = 0;
                 cells[row][rest].span = 1;
             }
@@ -567,8 +588,8 @@ void console_fb_set_status(const char *text)
             ch = ' ';
         }
         cells[row][c].ch = ch;
-        cells[row][c].fg = 0;
-        cells[row][c].bg = 6;
+        cells[row][c].fg = STATUS_FG;
+        cells[row][c].bg = STATUS_BG;
         cells[row][c].flags = 0;
         cells[row][c].span = 1;
     }

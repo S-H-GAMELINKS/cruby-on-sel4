@@ -134,7 +134,7 @@ static void note_failure(const char *what)
 
 static void report(const char *fmt, ...)
 {
-    char line[160];
+    char line[220];
     va_list args;
 
     va_start(args, fmt);
@@ -143,6 +143,26 @@ static void report(const char *fmt, ...)
 
     printf("xHCI: %s\n", line);
     console_fb_set_status(line);
+}
+
+/*
+ * The same, but to the serial line only.
+ *
+ * Used where things went as they should. The status row is the only place a
+ * message survives on a machine with no serial port, so it is kept for the ones
+ * worth surviving: if the keyboard works, saying so is noise, and if it does
+ * not, the reason wants that space.
+ */
+static void report_quiet(const char *fmt, ...)
+{
+    char line[220];
+    va_list args;
+
+    va_start(args, fmt);
+    vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+
+    printf("xHCI: %s\n", line);
 }
 
 /*
@@ -1232,6 +1252,18 @@ bool xhci_init(void)
     if (!running) {
         report("c%u[%s] no mapped controller answered", controller_count, controller_bars);
         return false;
+    }
+
+    /*
+     * Quiet when there is a keyboard to read, because then the screen belongs to
+     * whatever is being shown on it. Otherwise the summary stays up: it names
+     * every controller and what each port answered, which is where to start.
+     */
+    for (int i = 0; i < device_count; i++) {
+        if (devices[i].keyboard && devices[i].dci != 0) {
+            report_quiet("c%u[%s]%s", controller_count, controller_bars, summary);
+            return true;
+        }
     }
 
     report("c%u[%s]%s", controller_count, controller_bars, summary);
