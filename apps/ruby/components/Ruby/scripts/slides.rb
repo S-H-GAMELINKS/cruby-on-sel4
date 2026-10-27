@@ -23,7 +23,7 @@ end
 STDOUT.sync = true
 STDERR.sync = true
 
-TALK_SECONDS = 5 * 60
+TALK_SECONDS = 15 * 60
 REFRESH_INTERVAL = 0.2
 
 # The deck lives in the CPIO archive alongside this script. An argument
