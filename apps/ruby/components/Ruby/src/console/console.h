@@ -26,25 +26,29 @@
 extern const uint8_t console_font[CONSOLE_FONT_GLYPHS][CONSOLE_FONT_HEIGHT];
 
 /*
- * Everything above ASCII comes from Misaki, an 8x8 Japanese font whose half
- * width characters occupy 4x8 and full width ones 8x8. Both are exactly half a
- * console cell in each direction, so a glyph drawn at twice the console's scale
- * fills one cell or two precisely -- which is what lets a 4x8 face share a
- * terminal with an 8x16 one without either being stretched.
+ * Everything above ASCII comes from Shinonome, a 16 dot Japanese font whose half
+ * width characters occupy 8x16 and full width ones 16x16. Those are one console
+ * cell and two, so a glyph is drawn at the console's own scale, the same as
+ * Terminus, and neither face is stretched to meet the other.
  *
- * `wide` is the font's own DWIDTH, and decides how many cells the character
- * advances. Reline computes the same distinction from East Asian Width when it
- * lays out a line, so the two have to agree or the cursor drifts.
+ * Each row is two bytes, left byte first, most significant bit leftmost. A half
+ * width glyph uses only the left byte.
+ *
+ * `wide` decides how many cells the character advances. Reline computes the
+ * same distinction from East Asian Width when it lays out a line, so the two
+ * have to agree or the cursor drifts.
  */
+#define CONSOLE_WIDE_GLYPH_HEIGHT 16
+
 typedef struct {
     uint16_t codepoint;
     uint8_t wide;
-    uint8_t rows[8];
+    uint8_t rows[CONSOLE_WIDE_GLYPH_HEIGHT * 2];
 } console_glyph_t;
 
 /* Sorted by code point, so lookup bisects. */
-extern const console_glyph_t console_misaki[];
-extern const size_t console_misaki_count;
+extern const console_glyph_t console_shinonome[];
+extern const size_t console_shinonome_count;
 
 /*
  * Whether a framebuffer was configured and could be mapped. Everything below is

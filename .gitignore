@@ -9,3 +9,4 @@
 apps/ruby/components/Ruby/images
 apps/ruby/components/Ruby/scripts/*.ppm
 apps/ruby/components/Ruby/scripts/slides.md
+apps/ruby/components/Ruby/tools/slides-pdf/slides.pdf

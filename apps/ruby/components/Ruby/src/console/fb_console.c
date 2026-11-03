@@ -388,17 +388,19 @@ int console_fb_cols(void)
 }
 
 /*
- * A glyph as the renderer needs it: the rows, how wide the source bitmap is, how
- * tall, and how many cells it covers.
+ * A glyph as the renderer needs it: the rows, how many bytes each row takes, how
+ * wide the source bitmap is, how tall, and how many cells it covers.
  *
- * The three sources have different dimensions but all magnify to the same cell.
- * A cell is 8*scale by 16*scale pixels, so Terminus at 8x16 magnifies by scale,
- * and Misaki at 4x8 or 8x8 by twice that -- filling one cell or two exactly. The
- * magnification is therefore derived rather than chosen, and is uniform in both
- * directions for every source, so nothing is ever stretched.
+ * The sources have different dimensions but all magnify to the same cell. A cell
+ * is 8*scale by 16*scale pixels, so Terminus at 8x16 and Shinonome at 8x16 or
+ * 16x16 all magnify by scale, filling one cell or two exactly, and the 8x8
+ * placeholder for a missing glyph by twice that. The magnification is therefore
+ * derived rather than chosen, and is uniform in both directions for every
+ * source, so nothing is ever stretched.
  */
 typedef struct {
     const uint8_t *rows;
+    int stride;
     int src_w;
     int src_h;
     int cells;
@@ -409,20 +411,20 @@ static const uint8_t missing_rows[8] = {
     0x00, 0x7e, 0x42, 0x42, 0x42, 0x42, 0x7e, 0x00,
 };
 
-static const console_glyph_t *misaki_find(uint16_t codepoint)
+static const console_glyph_t *shinonome_find(uint16_t codepoint)
 {
     size_t low = 0;
-    size_t high = console_misaki_count;
+    size_t high = console_shinonome_count;
 
     while (low < high) {
         size_t mid = low + (high - low) / 2;
 
-        if (console_misaki[mid].codepoint < codepoint) {
+        if (console_shinonome[mid].codepoint < codepoint) {
             low = mid + 1;
-        } else if (console_misaki[mid].codepoint > codepoint) {
+        } else if (console_shinonome[mid].codepoint > codepoint) {
             high = mid;
         } else {
-            return &console_misaki[mid];
+            return &console_shinonome[mid];
         }
     }
 
@@ -432,7 +434,7 @@ static const console_glyph_t *misaki_find(uint16_t codepoint)
 /*
  * How many cells a character occupies when the font has no opinion.
  *
- * Misaki states the width of every character it draws, so this only decides the
+ * The font states the width of every character it draws, so this only decides the
  * ones it does not. The ranges are the blocks East Asian Width calls wide or
  * full width, which is what Reline uses for the same purpose: getting this wrong
  * does not just misplace a glyph, it makes the line editor's idea of the cursor
@@ -462,7 +464,7 @@ static int cells_for(uint32_t codepoint)
         return 1;
     }
 
-    glyph = codepoint <= 0xffff ? misaki_find((uint16_t)codepoint) : NULL;
+    glyph = codepoint <= 0xffff ? shinonome_find((uint16_t)codepoint) : NULL;
     if (glyph != NULL) {
         return glyph->wide ? 2 : 1;
     }
@@ -477,22 +479,25 @@ static glyph_t glyph_for(uint16_t codepoint)
 
     if (codepoint >= CONSOLE_FONT_FIRST && codepoint <= CONSOLE_FONT_LAST) {
         glyph.rows = console_font[codepoint - CONSOLE_FONT_FIRST];
+        glyph.stride = 1;
         glyph.src_w = CONSOLE_FONT_WIDTH;
         glyph.src_h = CONSOLE_FONT_HEIGHT;
         glyph.cells = 1;
         return glyph;
     }
 
-    found = misaki_find(codepoint);
+    found = shinonome_find(codepoint);
     if (found != NULL) {
         glyph.rows = found->rows;
-        glyph.src_w = found->wide ? 8 : 4;
-        glyph.src_h = 8;
+        glyph.stride = 2;
+        glyph.src_w = found->wide ? 16 : 8;
+        glyph.src_h = CONSOLE_WIDE_GLYPH_HEIGHT;
         glyph.cells = found->wide ? 2 : 1;
         return glyph;
     }
 
     glyph.rows = missing_rows;
+    glyph.stride = 1;
     glyph.src_w = 8;
     glyph.src_h = 8;
     glyph.cells = codepoint_is_wide(codepoint) ? 2 : 1;
@@ -570,14 +575,14 @@ static void draw_glyph(int row, int col, int span, int rows_tall, int cursor)
     }
 
     for (int sy = 0; sy < glyph.src_h; sy++) {
-        uint8_t bits = glyph.rows[sy];
+        const uint8_t *bits = glyph.rows + sy * glyph.stride;
 
         for (int ry = 0; ry < pixels_y; ry++) {
             int y = row * cell_h + sy * pixels_y + ry;
             volatile uint32_t *out = pixel_at(col * cell_w, y);
 
             for (int sx = 0; sx < glyph.src_w; sx++) {
-                uint32_t colour = (bits & (0x80u >> sx)) != 0 ? fg : bg;
+                uint32_t colour = (bits[sx / 8] & (0x80u >> (sx % 8))) != 0 ? fg : bg;
 
                 for (int rx = 0; rx < pixels_x; rx++) {
                     *out = colour;

@@ -207,8 +207,14 @@ def title_col
   content_col
 end
 
+# Every kind of text has one size, whatever the slide holds. Text that does not
+# fit is wrapped rather than shrunk, so a deck controls its layout with explicit
+# line breaks (\n or <br>) instead of the tool choosing a size per slide.
 TITLE_MODE = 2
 SUBTITLE_MODE = 1
+BODY_MODE = 1
+CODE_MODE = 1
+FOOTER_MODE = 1
 TITLE_MAX_LINES = 2
 
 # Widths below are in the magnified cells of their own mode, so they are divided
@@ -222,19 +228,19 @@ def subtitle_text_w
 end
 
 def body_text_w
-  @body_text_w ||= [content_w / 2, 16].max
+  @body_text_w ||= [content_w / font_span(BODY_MODE), 10].max
 end
 
-def bullet_wrap_w
-  [body_text_w, 10].max
+def footer_text_w
+  @footer_text_w ||= [content_w / font_span(FOOTER_MODE), 10].max
 end
 
-def body_compact_w
-  [content_w - 2, 20].max
+def code_box_w
+  @code_box_w ||= [content_w / font_span(CODE_MODE), 12].max
 end
 
 def code_inner_w
-  [content_w - 4, 8].max
+  code_box_w - 4
 end
 
 def title_row
@@ -262,6 +268,10 @@ def title_slide_title_row
 end
 
 Slide = Struct.new(:title, :subtitle, :bullets, :code, :image, :notes, :layout, keyword_init: true)
+
+# A bullet and how deeply it is nested: 0 for a top level item, 1 for one
+# indented under it, and so on.
+Bullet = Struct.new(:text, :level)
 
 # ---------------------------------------------------------------------------
 # Input
@@ -351,6 +361,12 @@ def parse_image_directive(line)
   m && m[1]
 end
 
+# Two spaces of indentation per level, as Markdown writes nested lists. Deeper
+# than two levels is drawn at two: there is no width left for more.
+def bullet_level(line)
+  [line[/\A */].size / 2, 2].min
+end
+
 def expand_line_breaks(text)
   text.to_s.gsub(%r{<br\s*/?>}i, "\n").gsub('\\n', "\n")
 end
@@ -383,7 +399,7 @@ def parse_markdown(text)
       when /\Alayout:/ then slide.layout = stripped.split(':', 2)[1].to_s.strip
       when /\A# / then slide.title = expand_line_breaks(stripped[2..])
       when /\A## / then slide.subtitle = stripped[3..]
-      when /\A- / then slide.bullets << stripped[2..]
+      when /\A- / then slide.bullets << Bullet.new(expand_line_breaks(stripped[2..]), bullet_level(line))
       when /\A> /
         note = stripped[2..]
         slide.notes = slide.notes ? "#{slide.notes}  #{note}" : note
@@ -408,7 +424,7 @@ def fallback_slides
   [Slide.new(
     title: 'CRuby on seL4',
     subtitle: "#{SLIDES_PATH} not found",
-    bullets: ['Add it to the CPIO archive'],
+    bullets: [Bullet.new('Add it to the CPIO archive', 0)],
     notes: 'Right/Space next  Left/Back prev  q quit',
     layout: 'title'
   )]
@@ -459,61 +475,57 @@ def render_title(title, subtitle)
   write_at(subtitle_row, title_col, fit(subtitle, subtitle_text_w), SUBTITLE_MODE, '1;37')
 end
 
+# A top level item takes a dash; a nested one is indented and takes a dot, so
+# the two read as different kinds of line rather than as one long list.
+def bullet_marker(level)
+  level.zero? ? '- ' : ('  ' * level) + '・'
+end
+
 def render_bullets(items, start_row)
   return start_row if items.nil? || items.empty?
 
-  # Largest text that still fits, preferred in order.
-  layouts = [
-    [2, [content_w / font_span(2), 8].max],
-    [1, bullet_wrap_w],
-    [0, body_compact_w]
-  ]
-  available = [body_last_row - start_row + 1, 1].max
-
-  chosen = layouts.find do |_mode, width|
-    items.all? { |item| text_width(item) <= [width - 2, 1].max }
-  end
-  chosen ||= layouts.find do |mode, width|
-    needed = items.sum do |item|
-      wrap_text(item, [width - 2, 1].max).length * font_rows(mode)
-    end + items.length - 1
-    needed <= available
-  end
-  chosen ||= layouts.last
-
-  mode, width = chosen
-  step = font_rows(mode)
+  step = font_rows(BODY_MODE)
   row = start_row
 
-  items.each do |item|
-    wrap_text(item, [width - 2, 1].max).each_with_index do |line, idx|
+  items.each_with_index do |item, i|
+    # A blank row separates top level items. Nested ones stay against the item
+    # they belong to.
+    row += 1 if i.positive? && item.level.zero?
+
+    marker = bullet_marker(item.level)
+    # Continuation lines, whether from a line break in the deck or from
+    # wrapping, are indented under the text rather than under the marker.
+    indent = ' ' * text_width(marker)
+    wrap_text(item.text, [body_text_w - text_width(marker), 1].max).each_with_index do |line, idx|
       break if row + step - 1 > body_last_row
-      prefix = idx.zero? ? '- ' : '  '
-      write_at(row, content_col, fit(prefix + line, width), mode, '37')
+      write_at(row, content_col, fit((idx.zero? ? marker : indent) + line, body_text_w), BODY_MODE, '37')
       row += step
     end
-    row += 1
   end
 
-  row
+  # One row of space below the list, before whatever follows it.
+  row + 1
 end
 
 def render_code(lines, start_row)
   return start_row if lines.nil? || lines.empty?
 
-  rule = fit('+' + ('-' * (content_w - 2)) + '+', content_w)
-  write_at(start_row, content_col, rule, 0, '36')
-  row = start_row + 1
+  step = font_rows(CODE_MODE)
+  rule = '+' + ('-' * (code_box_w - 2)) + '+'
+  write_at(start_row, content_col, rule, CODE_MODE, '36')
+  row = start_row + step
 
-  lines.each do |line|
-    break if row > body_last_row
-    write_at(row, content_col, '| ' + fit(line, code_inner_w) + ' |', 0, '36')
-    row += 1
+  # A line too long for the box is wrapped rather than cut, so nothing written in
+  # the deck goes missing; breaking it by hand reads better.
+  lines.flat_map { |line| wrap_text(line, code_inner_w) }.each do |line|
+    break if row + step - 1 > body_last_row
+    write_at(row, content_col, '| ' + fit(line, code_inner_w) + ' |', CODE_MODE, '36')
+    row += step
   end
 
-  if row <= SCREEN_H - 4
-    write_at(row, content_col, rule, 0, '36')
-    row += 1
+  if row + step - 1 <= SCREEN_H - 4
+    write_at(row, content_col, rule, CODE_MODE, '36')
+    row += step
   end
 
   row
@@ -540,8 +552,7 @@ end
 
 def render_footer(text)
   return unless text
-  mode = text_width(text) <= body_text_w ? 1 : 0
-  write_at(SCREEN_H - 1, content_col, fit(text, mode == 1 ? body_text_w : content_w), mode, '36')
+  write_at(SCREEN_H - 1, content_col, fit(text, footer_text_w), FOOTER_MODE, '36')
 end
 
 def render_title_slide(slide, index, total, remaining)
@@ -567,10 +578,13 @@ end
 def render_takahashi_slide(slide, index, total, remaining)
   render_header(index, total, remaining)
 
-  step = font_rows(TAKAHASHI_MODE)
+  # A row of space between lines. Shinonome draws to the full height of its
+  # box, so lines set edge to edge would touch.
+  glyph_h = font_rows(TAKAHASHI_MODE)
+  step = glyph_h + 1
   lines = takahashi_lines(slide.title, TAKAHASHI_MODE)
-  lines = lines.first([(SCREEN_H - 5) / step, 1].max)
-  block_h = ((lines.length - 1) * step) + step
+  lines = lines.first([(SCREEN_H - 5 + 1) / step, 1].max)
+  block_h = ((lines.length - 1) * step) + glyph_h
   row = [((SCREEN_H - block_h) / 2) + 1, 3].max
 
   lines.each_with_index do |line, idx|

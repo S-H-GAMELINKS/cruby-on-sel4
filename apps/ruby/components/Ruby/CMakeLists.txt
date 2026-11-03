@@ -199,7 +199,7 @@ DeclareCAmkESComponent(
         src/ruby_syscall_fs.c
         src/console/fb_console.c
         src/console/font_8x16.c
-        src/console/font_misaki.c
+        src/console/font_shinonome.c
         src/xhci/hid.c
         src/xhci/pci.c
         src/xhci/xhci.c
