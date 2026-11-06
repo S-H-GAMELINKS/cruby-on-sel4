@@ -51,6 +51,7 @@ ${CC:-cc} -O2 -std=gnu11 \
     "$here/slides-pdf/render.c" \
     "$component/src/console/fb_console.c" \
     "$component/src/console/font_8x16.c" \
+    "$component/src/console/font_blocks.c" \
     "$component/src/console/font_shinonome.c"
 
 # The console's size in cells, as fb_console.c works it out: the last row is the

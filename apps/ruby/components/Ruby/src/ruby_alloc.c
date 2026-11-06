@@ -16,11 +16,15 @@
  * Owning malloc, mmap and mremap together keeps every allocation inside one
  * arena whose bounds this file controls, so none of those paths are reachable.
  *
- * The allocator is deliberately simple: a bump arena with a free list that reuses
- * whole blocks. It does not coalesce adjacent free blocks, so fragmentation is
- * possible. munmap is accepted without releasing anything, because Ruby's GC
- * calls it on page-trimming ranges derived from a larger mapping; treating those
- * addresses as allocation pointers would be unsafe without per-mapping metadata.
+ * The allocator is deliberately simple: a bump arena whose blocks, once freed,
+ * are reused whole. Blocks are never split or coalesced, so what keeps the arena
+ * from being eaten away is that each block is reused only for a request of its
+ * own size class. With a single free list, a block freed by a large request
+ * went to whatever small request came next, the next large request had to be
+ * carved afresh, and a program that keeps building and dropping large strings
+ * -- a game drawing a frame -- ran the arena dry in minutes.
+ *
+ * munmap releases a mapping only once all of it has been unmapped; see there.
  *
  * musl's own allocator reaches the internal names rather than the public ones
  * (src/malloc/mallocng/glue.h defines mmap to __mmap, src/malloc/oldmalloc calls
@@ -54,17 +58,27 @@
  * than corrupting the free list. */
 #define ALLOC_MAGIC 0x52414c43u
 
+/*
+ * Size classes: four to each power of two, so a request is rounded up by at most
+ * a quarter. Coarser classes would waste more of an arena that cannot grow;
+ * finer ones would leave more blocks stranded in classes nothing asks for.
+ */
+#define CLASS_MIN_SHIFT 5   /* 32 bytes, the smallest block */
+#define CLASS_STEPS 4
+#define CLASS_COUNT ((sizeof(size_t) * 8 - CLASS_MIN_SHIFT) * CLASS_STEPS)
+
 typedef struct alloc_header {
     size_t size;
     size_t capacity;
     struct alloc_header *next_free;
-    unsigned int is_free;
+    uint16_t is_free;
+    uint16_t size_class;
     unsigned int magic;
 } alloc_header_t;
 
 static unsigned char ruby_alloc_arena[RUBY_ALLOC_ARENA_SIZE] __attribute__((aligned(4096)));
 static size_t ruby_alloc_offset;
-static alloc_header_t *free_list;
+static alloc_header_t *free_lists[CLASS_COUNT];
 
 static int is_power_of_two(size_t value)
 {
@@ -86,20 +100,46 @@ static alloc_header_t *payload_header(void *ptr)
     return (alloc_header_t *)ptr - 1;
 }
 
-static int block_matches(alloc_header_t *header, size_t size, size_t alignment)
+/* Round a request up to its class, and say which class that is. Zero when the
+ * request is too large to round. */
+static size_t size_class_of(size_t size, unsigned int *size_class)
 {
-    return header->capacity >= size && ((uintptr_t)header_payload(header) % alignment) == 0;
+    unsigned int shift;
+    size_t step;
+    size_t rounded;
+
+    if (size <= ((size_t)1 << CLASS_MIN_SHIFT)) {
+        *size_class = 0;
+        return (size_t)1 << CLASS_MIN_SHIFT;
+    }
+
+    /* The power of two at or below the request, and a quarter of it. */
+    shift = (unsigned int)(sizeof(size_t) * 8 - 1) - (unsigned int)__builtin_clzl(size);
+    step = ((size_t)1 << shift) / CLASS_STEPS;
+    rounded = (size + step - 1) & ~(step - 1);
+    if (rounded < size) {
+        return 0;
+    }
+    if (rounded == ((size_t)1 << (shift + 1))) {
+        /* Rounded up into the next power of two: its first class. */
+        shift++;
+        step = 0;
+    }
+
+    *size_class = (shift - CLASS_MIN_SHIFT) * CLASS_STEPS +
+                  (step == 0 ? 0 : (unsigned int)((rounded - ((size_t)1 << shift)) / step));
+    return rounded;
 }
 
-static void *reuse_free_block(size_t size, size_t alignment)
+static void *reuse_free_block(unsigned int size_class, size_t size, size_t alignment)
 {
     alloc_header_t *prev = NULL;
-    alloc_header_t *current = free_list;
+    alloc_header_t *current = free_lists[size_class];
 
     while (current != NULL) {
-        if (block_matches(current, size, alignment)) {
+        if (((uintptr_t)header_payload(current) % alignment) == 0) {
             if (prev == NULL) {
-                free_list = current->next_free;
+                free_lists[size_class] = current->next_free;
             } else {
                 prev->next_free = current->next_free;
             }
@@ -122,6 +162,8 @@ static void *arena_alloc(size_t size, size_t alignment)
     uintptr_t header_addr;
     uintptr_t next;
     alloc_header_t *header;
+    unsigned int size_class;
+    size_t capacity;
     void *reused;
 
     if (size == 0) {
@@ -135,7 +177,13 @@ static void *arena_alloc(size_t size, size_t alignment)
         return NULL;
     }
 
-    reused = reuse_free_block(size, alignment);
+    capacity = size_class_of(size, &size_class);
+    if (capacity == 0 || size_class >= CLASS_COUNT) {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    reused = reuse_free_block(size_class, size, alignment);
     if (reused != NULL) {
         return reused;
     }
@@ -144,7 +192,7 @@ static void *arena_alloc(size_t size, size_t alignment)
      * requested alignment. */
     base = (uintptr_t)ruby_alloc_arena + ruby_alloc_offset;
     header_addr = align_up(base + sizeof(*header), alignment) - sizeof(*header);
-    next = header_addr + sizeof(*header) + size;
+    next = header_addr + sizeof(*header) + capacity;
 
     if (next < header_addr || next > (uintptr_t)ruby_alloc_arena + sizeof(ruby_alloc_arena)) {
         errno = ENOMEM;
@@ -153,9 +201,10 @@ static void *arena_alloc(size_t size, size_t alignment)
 
     header = (alloc_header_t *)header_addr;
     header->size = size;
-    header->capacity = size;
+    header->capacity = capacity;
     header->next_free = NULL;
     header->is_free = 0;
+    header->size_class = (uint16_t)size_class;
     header->magic = ALLOC_MAGIC;
     ruby_alloc_offset = next - (uintptr_t)ruby_alloc_arena;
     return header_payload(header);
@@ -180,8 +229,8 @@ void free(void *ptr)
     }
 
     header->is_free = 1;
-    header->next_free = free_list;
-    free_list = header;
+    header->next_free = free_lists[header->size_class];
+    free_lists[header->size_class] = header;
 }
 
 void *calloc(size_t count, size_t size)
@@ -216,13 +265,21 @@ void *realloc(void *ptr, size_t size)
     }
 
     old_size = payload_header(ptr)->size;
-    if (payload_header(ptr)->capacity >= size) {
+    /* Kept in place unless it has shrunk to less than half the block: a string
+     * built large and then trimmed would otherwise hold its largest size for as
+     * long as it lives. */
+    if (payload_header(ptr)->capacity >= size && size > payload_header(ptr)->capacity / 2) {
         payload_header(ptr)->size = size;
         return ptr;
     }
 
     new_ptr = malloc(size);
     if (new_ptr == NULL) {
+        if (payload_header(ptr)->capacity >= size) {
+            /* Only shrinking; staying put is still an answer. */
+            payload_header(ptr)->size = size;
+            return ptr;
+        }
         return NULL;
     }
 
@@ -304,6 +361,30 @@ void *__libc_realloc(void *ptr, size_t size)
  *    to the page boundary, so round the request up rather than handing back a
  *    block that ends mid-page.
  */
+/* Every mapping handed out, with how much of it has not been unmapped yet. A
+ * mapping that does not fit is still handed out, just never reclaimed. */
+#define MAX_MAPPINGS 2048
+
+typedef struct {
+    uintptr_t base;
+    size_t length;
+    size_t remaining;
+} mapping_t;
+
+static mapping_t mappings[MAX_MAPPINGS];
+static size_t mapping_count;
+
+static void *record_mapping(void *ptr, size_t length)
+{
+    if (mapping_count < MAX_MAPPINGS) {
+        mappings[mapping_count].base = (uintptr_t)ptr;
+        mappings[mapping_count].length = length;
+        mappings[mapping_count].remaining = length;
+        mapping_count++;
+    }
+    return ptr;
+}
+
 static const cpio_file_data_t *cpio_file_for_fd(int fd)
 {
     muslcsys_fd_t *fds;
@@ -380,7 +461,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         }
         memset(ptr, 0, rounded);
         memcpy(ptr, file->start + offset, available);
-        return ptr;
+        return record_mapping(ptr, rounded);
     }
 
     ptr = arena_alloc(rounded, MMAP_ALIGNMENT);
@@ -389,7 +470,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     }
 
     memset(ptr, 0, rounded);
-    return ptr;
+    return record_mapping(ptr, rounded);
 }
 
 void *__mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
@@ -398,27 +479,53 @@ void *__mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offse
 }
 
 /*
- * Release a mapping when it is one this allocator handed out whole.
+ * Release a mapping once all of it has been unmapped.
  *
  * Ruby's GC maps and unmaps heap pages continuously, so ignoring munmap entirely
- * means the arena only ever shrinks: every page the collector releases is lost
- * for the rest of the run.
+ * means every page the collector releases is lost for the rest of the run.
  *
- * The caution that motivated ignoring it still applies, though. The GC also
- * unmaps sub-ranges to trim a larger mapping down to alignment, and those
- * addresses are not allocation pointers. free() distinguishes the two for us: it
- * checks the header immediately below the pointer for this allocator's magic and
- * ignores anything that does not match, so a trim request is dropped while a
- * whole mapping is reclaimed.
+ * Nor can munmap simply free what it is given. The GC maps twice the 64 KiB it
+ * needs and unmaps the excess on either side to leave an aligned page
+ * (heap_page_body_allocate in gc/default.c); later it unmaps that page alone.
+ * The first trim starts at the mapping itself, so freeing on it would hand the
+ * whole block, the page in use included, to the next allocation; and the page's
+ * own address is not one this allocator ever returned.
+ *
+ * So each mapping is recorded with how much of it is still mapped, and an unmap
+ * anywhere inside it counts against that. The block goes back to the allocator
+ * when nothing of it is left. Ranges inside no recorded mapping are ignored, as
+ * all of them were before.
  */
+static int munmap_ranges(void *addr, size_t length)
+{
+    uintptr_t start = (uintptr_t)addr;
+
+    for (size_t i = 0; i < mapping_count; i++) {
+        mapping_t *mapping = &mappings[i];
+
+        if (start < mapping->base || start >= mapping->base + mapping->length) {
+            continue;
+        }
+
+        length = (length + MMAP_ALIGNMENT - 1) & ~(size_t)(MMAP_ALIGNMENT - 1);
+        mapping->remaining = length >= mapping->remaining ? 0 : mapping->remaining - length;
+        if (mapping->remaining == 0) {
+            free((void *)mapping->base);
+            mappings[i] = mappings[--mapping_count];
+        }
+        return 0;
+    }
+
+    return 0;
+}
+
 int munmap(void *addr, size_t length)
 {
-    (void)length;
-
-    if (addr != NULL) {
-        free(addr);
+    if (addr == NULL || length == 0) {
+        return 0;
     }
-    return 0;
+
+    return munmap_ranges(addr, length);
 }
 
 int __munmap(void *addr, size_t length)

@@ -26,6 +26,19 @@
 extern const uint8_t console_font[CONSOLE_FONT_GLYPHS][CONSOLE_FONT_HEIGHT];
 
 /*
+ * Half width box drawing and block elements, in the same 8x16 layout as the font
+ * above.
+ *
+ * Shinonome has some of these, but as full width characters, because JIS draws
+ * them that way. Terminal programs count them as one column -- a renderer that
+ * paints with upper half blocks expects each to cover exactly one cell -- so they
+ * are looked up here first and always advance by one.
+ *
+ * Returns the sixteen rows, or NULL for a code point this does not cover.
+ */
+const uint8_t *console_block_find(uint16_t codepoint);
+
+/*
  * Everything above ASCII comes from Shinonome, a 16 dot Japanese font whose half
  * width characters occupy 8x16 and full width ones 16x16. Those are one console
  * cell and two, so a glyph is drawn at the console's own scale, the same as

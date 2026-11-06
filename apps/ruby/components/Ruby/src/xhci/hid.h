@@ -22,6 +22,14 @@
  */
 void hid_keyboard_report(const volatile uint8_t *report, size_t length, uint8_t *previous);
 
-/* Whether anything is waiting, and taking it. */
+/*
+ * The same for a report from the Steam Deck controller's own interface, whose
+ * buttons are typed as the keys hid.c gives them. `previous` is the caller's
+ * copy of the keyboard report they were last turned into.
+ */
+void hid_steam_report(const volatile uint8_t *report, size_t length, uint8_t *previous);
+
+/* Whether anything is waiting, and taking it. Both also produce the repeats of
+ * held keys that have come due, since nothing else runs on a clock here. */
 int hid_has_input(void);
 size_t hid_take(char *buf, size_t len);

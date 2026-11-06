@@ -39,6 +39,11 @@ set(CRUBY_STATIC_LIB "${CRUBY_BUILD_DIR}/libruby-static.a")
 set(CRUBY_EXT_INIT_OBJ "${CRUBY_BUILD_DIR}/ext/extinit.o")
 set(CRUBY_EXT_CONSOLE_LIB "${CRUBY_BUILD_DIR}/ext/io/console/console.a")
 set(CRUBY_EXT_WAIT_LIB "${CRUBY_BUILD_DIR}/ext/io/wait/wait.a")
+# json is two extensions under one directory; ext/json itself has no C source.
+# extinit.c registers them as json/ext/parser.so and json/ext/generator.so, which
+# is what json/ext.rb requires.
+set(CRUBY_EXT_JSON_PARSER_LIB "${CRUBY_BUILD_DIR}/ext/json/parser/parser.a")
+set(CRUBY_EXT_JSON_GENERATOR_LIB "${CRUBY_BUILD_DIR}/ext/json/generator/generator.a")
 
 # Encodings are static as well (ENCSTATIC = static), and the generated
 # enc/encinit.c provides the real Init_enc. libruby-static.a also carries
@@ -49,6 +54,15 @@ set(CRUBY_ENC_INIT_OBJ "${CRUBY_BUILD_DIR}/enc/encinit.o")
 set(CRUBY_ENC_LIB "${CRUBY_BUILD_DIR}/enc/libenc.a")
 set(CRUBY_TRANS_LIB "${CRUBY_BUILD_DIR}/enc/libtrans.a")
 
+
+# The extensions linked in. Kept in a variable so the configure step can be made
+# to depend on it below.
+#
+# Each entry is matched against every directory holding an extconf.rb with
+# File.fnmatch (extmk.rb), one directory at a time, so "json" selects ext/json
+# alone -- which has no C source and builds nothing -- and json/* is what selects
+# json/parser and json/generator.
+set(CRUBY_EXTS "io/console,io/wait,json,json/*")
 
 ExternalProject_Add(
     cruby_external
@@ -93,11 +107,19 @@ ExternalProject_Add(
             # musl headers are visible and stdckdint.h is absent. Force CRuby onto
             # its __builtin_*_overflow fallback instead.
             ac_cv_header_stdckdint_h=no
-            # reline needs io/console and io/wait. Building every extension would
-            # fail on the ones wanting zlib, openssl and friends, none of which
-            # exist in this sysroot. ext/Setup is no longer consulted in Ruby 4.0;
-            # exts.mk is generated from configure's selection instead.
-            --with-ext=io/console,io/wait
+            # reline needs io/console and io/wait, and Termfront needs json.
+            # Building every extension would fail on the ones wanting zlib,
+            # openssl and friends, none of which exist in this sysroot. ext/Setup
+            # is no longer consulted in Ruby 4.0; exts.mk is generated from
+            # configure's selection instead.
+            --with-ext=${CRUBY_EXTS}
+        # exts.mk records which extensions are built, but nothing in common.mk
+        # makes it stale when configure runs again: it depends on
+        # ext/configure-ext.mk, which is rewritten only when its text changes,
+        # and on timestamp files made once. Removing it here, which only
+        # happens when configure does, has the next make regenerate it from
+        # the new selection.
+        COMMAND ${CMAKE_COMMAND} -E rm -f exts.mk
     # common.mk:292 has main depend on both exts and libencs; building exts alone
     # leaves the encodings unbuilt (common.mk:991).
     BUILD_COMMAND make -j${CRUBY_JOBS} exts
@@ -109,6 +131,8 @@ ExternalProject_Add(
       "${CRUBY_EXT_INIT_OBJ}"
       "${CRUBY_EXT_CONSOLE_LIB}"
       "${CRUBY_EXT_WAIT_LIB}"
+      "${CRUBY_EXT_JSON_PARSER_LIB}"
+      "${CRUBY_EXT_JSON_GENERATOR_LIB}"
       "${CRUBY_ENC_INIT_OBJ}"
       "${CRUBY_ENC_LIB}"
       "${CRUBY_TRANS_LIB}"
@@ -121,6 +145,16 @@ ExternalProject_Add(
 
 # Mirror the muslc_imported pattern: wrapping the archive in an IMPORTED target
 # lets DeclareCAmkESComponent take it by name and lets CMake order the build.
+# ExternalProject runs configure once and never again: a change to the arguments
+# above does not make it stale, so a build tree configured before an extension
+# was added keeps an exts.mk without it, and the link then fails on an archive
+# that was never built. Recording the list in a file and making configure
+# depend on it closes that gap. file(CONFIGURE) only touches the file when the
+# contents differ, so an unchanged list costs nothing.
+set(CRUBY_EXTS_STAMP "${CRUBY_PREFIX}/configure-exts.txt")
+file(CONFIGURE OUTPUT "${CRUBY_EXTS_STAMP}" CONTENT "${CRUBY_EXTS}\n")
+ExternalProject_Add_StepDependencies(cruby_external configure "${CRUBY_EXTS_STAMP}")
+
 add_library(cruby_static STATIC IMPORTED GLOBAL)
 add_dependencies(cruby_static cruby_external)
 set_property(TARGET cruby_static PROPERTY IMPORTED_LOCATION "${CRUBY_STATIC_LIB}")
@@ -136,6 +170,36 @@ set_property(TARGET cruby_ext_console PROPERTY IMPORTED_LOCATION "${CRUBY_EXT_CO
 add_library(cruby_ext_wait STATIC IMPORTED GLOBAL)
 add_dependencies(cruby_ext_wait cruby_external)
 set_property(TARGET cruby_ext_wait PROPERTY IMPORTED_LOCATION "${CRUBY_EXT_WAIT_LIB}")
+
+add_library(cruby_ext_json_parser STATIC IMPORTED GLOBAL)
+add_dependencies(cruby_ext_json_parser cruby_external)
+set_property(TARGET cruby_ext_json_parser PROPERTY IMPORTED_LOCATION "${CRUBY_EXT_JSON_PARSER_LIB}")
+
+add_library(cruby_ext_json_generator STATIC IMPORTED GLOBAL)
+add_dependencies(cruby_ext_json_generator cruby_external)
+set_property(TARGET cruby_ext_json_generator PROPERTY IMPORTED_LOCATION "${CRUBY_EXT_JSON_GENERATOR_LIB}")
+
+# Termfront, the terminal FPS the launcher runs alongside the slides. It is pure
+# Ruby, so it is only unpacked: its lib/ and the event data it reads go into the
+# archive, and nothing is built. Pinned like CRuby, so that the archive does not
+# change underneath a build.
+set(TERMFRONT_COMMIT "0e71130c289df3c62014fefd0e15ae73da0cc41d" CACHE STRING "Termfront commit to embed")
+set(TERMFRONT_SHA256
+    "f30e3a18a1dd97d94a77e2ad29bcdb61806689cace14f0a0331c79900086d77d"
+    CACHE STRING "SHA256 of the Termfront source tarball"
+)
+set(TERMFRONT_SRC_DIR "${CMAKE_CURRENT_BINARY_DIR}/termfront/src/termfront_external")
+
+ExternalProject_Add(
+    termfront_external
+    PREFIX "${CMAKE_CURRENT_BINARY_DIR}/termfront"
+    URL "https://github.com/S-H-GAMELINKS/termfront/archive/${TERMFRONT_COMMIT}.tar.gz"
+    URL_HASH "SHA256=${TERMFRONT_SHA256}"
+    SOURCE_DIR "${TERMFRONT_SRC_DIR}"
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND ""
+    INSTALL_COMMAND ""
+)
 
 add_library(cruby_enc_init OBJECT IMPORTED GLOBAL)
 add_dependencies(cruby_enc_init cruby_external)
@@ -170,13 +234,14 @@ add_custom_command(
     COMMAND "${CMAKE_CURRENT_LIST_DIR}/make-archive.sh"
             "${CRUBY_SRC_DIR}"
             "${CRUBY_BUILD_DIR}"
+            "${TERMFRONT_SRC_DIR}"
             "${RUBY_SCRIPT_DIR}"
             "${RUBY_ARCHIVE_STAGE}"
             "${RUBY_ARCHIVE_CPIO}"
             "${RUBY_ARCHIVE_ASM}"
             "${RUBY_ARCHIVE_OBJ}"
             "${CMAKE_C_COMPILER}"
-    DEPENDS cruby_external ${RUBY_SCRIPT_FILES}
+    DEPENDS cruby_external termfront_external ${RUBY_SCRIPT_FILES}
     BYPRODUCTS "${RUBY_ARCHIVE_CPIO}" "${RUBY_ARCHIVE_ASM}"
     COMMENT "Generate embedded Ruby CPIO archive"
     VERBATIM
@@ -194,11 +259,13 @@ DeclareCAmkESComponent(
     Ruby
     SOURCES
         src/ruby.c
+        src/hidden_command.c
         src/ruby_alloc.c
         src/ruby_libc_init.c
         src/ruby_syscall_fs.c
         src/console/fb_console.c
         src/console/font_8x16.c
+        src/console/font_blocks.c
         src/console/font_shinonome.c
         src/xhci/hid.c
         src/xhci/pci.c
@@ -221,6 +288,8 @@ DeclareCAmkESComponent(
         cruby_ext_init
         cruby_ext_console
         cruby_ext_wait
+        cruby_ext_json_parser
+        cruby_ext_json_generator
         # Same shape as the extensions: encinit.o pulls Init_big5 and friends out
         # of the archives that follow it.
         cruby_enc_init

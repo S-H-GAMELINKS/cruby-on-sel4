@@ -339,9 +339,9 @@ static volatile serial_ring_t *serial_ring(void)
 }
 
 /*
- * Blocking read of one character.
+ * Whether standard input has anything, from any of its sources.
  *
- * The wait has to be a loop with the emptiness check inside it. SerialServer only
+ * A wait on it has to be a loop with this check inside it. SerialServer only
  * emits a notification when the client has consumed something since the previous
  * one (serial.c:329-331), so a notification can arrive for characters already
  * drained, and conversely no fresh notification arrives while the client sits on
@@ -378,19 +378,7 @@ static int serial_has_input(void)
     return ring->head != ring->tail;
 }
 
-static char serial_getchar(void)
-{
-    volatile serial_ring_t *ring = serial_ring();
-    char c;
-
-    while (ring->head == ring->tail) {
-        seL4_Wait(stdin_getchar_notification(), NULL);
-    }
-
-    c = ring->buf[ring->head];
-    ring->head = (ring->head + 1) % sizeof(ring->buf);
-    return c;
-}
+static long poll_fds(struct pollfd *fds, unsigned long nfds, int64_t timeout_ns);
 
 /*
  * Deliver raw bytes; Reline owns the line.
@@ -441,26 +429,45 @@ static ssize_t serial_readv(const struct iovec *iov, int iovcnt)
         return 0;
     }
 
-    /* Replies come first and never block: the answer to a query the program has
-     * just written is already waiting, and blocking on the serial line ahead of
-     * it would deadlock a console that has no serial line at all. */
-    used += console_fb_take_reply(base, capacity);
-    if (used > 0) {
-        return (ssize_t)used;
+    for (;;) {
+        struct pollfd pfd;
+
+        /* Replies come first and never block: the answer to a query the program
+         * has just written is already waiting, and blocking on the serial line
+         * ahead of it would deadlock a console that has no serial line at all. */
+        used = console_fb_take_reply(base, capacity);
+        if (used > 0) {
+            return (ssize_t)used;
+        }
+
+        used = ps2_take(base, capacity);
+        if (used > 0) {
+            return (ssize_t)used;
+        }
+
+        xhci_poll();
+        used = hid_take(base, capacity);
+        if (used > 0) {
+            return (ssize_t)used;
+        }
+
+        if (serial_ring()->head != serial_ring()->tail) {
+            break;
+        }
+
+        /*
+         * Nothing from anywhere yet. Waiting on the serial line alone would
+         * never look at the keyboards again, and on the Steam Deck, which has
+         * no serial input, nothing would ever end the wait: a reader that asks
+         * for one more byte after an Escape, to see whether a cursor key
+         * follows, would stop the machine. poll waits for every source.
+         */
+        pfd.fd = STDIN_FILENO;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        (void)poll_fds(&pfd, 1, -1);
     }
 
-    used += ps2_take(base, capacity);
-    if (used > 0) {
-        return (ssize_t)used;
-    }
-
-    xhci_poll();
-    used += hid_take(base, capacity);
-    if (used > 0) {
-        return (ssize_t)used;
-    }
-
-    base[used++] = serial_getchar();
     while (used < capacity && serial_ring()->head != serial_ring()->tail) {
         base[used++] = serial_take();
     }
@@ -660,6 +667,16 @@ int fcntl(int fd, int cmd, ...)
  */
 #define RUBY_TIMER_ID 0
 
+/*
+ * How often a wait on standard input looks at the keyboards. Neither the PS/2
+ * controller nor the USB one raises an interrupt here, so a key pressed during
+ * a wait is seen only when the wait next looks. The serial line wakes a wait by
+ * itself; the keyboards need the timer to, and without it a wait with no
+ * deadline would never look again. Ten milliseconds is well inside what anyone
+ * pressing a button would notice.
+ */
+#define KEYBOARD_POLL_NS (10ull * 1000 * 1000)
+
 /* Negative waits forever, zero does not wait, positive waits that many
  * nanoseconds. */
 static long poll_fds(struct pollfd *fds, unsigned long nfds, int64_t timeout_ns)
@@ -668,6 +685,7 @@ static long poll_fds(struct pollfd *fds, unsigned long nfds, int64_t timeout_ns)
     int watching_stdin = 0;
     int armed = 0;
     int expired = 0;
+    uint64_t deadline = 0;
 
     if (fds == NULL && nfds != 0) {
         return -EFAULT;
@@ -678,6 +696,10 @@ static long poll_fds(struct pollfd *fds, unsigned long nfds, int64_t timeout_ns)
         if (fds[i].fd == STDIN_FILENO && (fds[i].events & POLLIN) != 0) {
             watching_stdin = 1;
         }
+    }
+
+    if (timeout_ns > 0) {
+        deadline = timeout_time() + (uint64_t)timeout_ns;
     }
 
     for (;;) {
@@ -726,13 +748,36 @@ static long poll_fds(struct pollfd *fds, unsigned long nfds, int64_t timeout_ns)
             return ready;
         }
 
-        if (timeout_ns > 0 && !armed) {
-            if (timeout_oneshot_relative(RUBY_TIMER_ID, (uint64_t)timeout_ns) == 0) {
-                armed = 1;
-            } else {
-                /* No timer to wait on, so report the timeout immediately rather
-                 * than blocking for longer than asked. */
-                return 0;
+        /*
+         * The timer is set for whichever comes first: the deadline, or the next
+         * look at the keyboards. Waking for the keyboards is not expiry, so the
+         * deadline is kept as a time and compared against when the timer fires.
+         */
+        if (!armed) {
+            uint64_t wait = UINT64_MAX;
+
+            if (timeout_ns > 0) {
+                uint64_t now = timeout_time();
+
+                if (now >= deadline) {
+                    expired = 1;
+                    continue;
+                }
+                wait = deadline - now;
+            }
+            if (watching_stdin && wait > KEYBOARD_POLL_NS) {
+                wait = KEYBOARD_POLL_NS;
+            }
+            if (wait != UINT64_MAX) {
+                if (timeout_oneshot_relative(RUBY_TIMER_ID, wait) == 0) {
+                    armed = 1;
+                } else if (timeout_ns > 0) {
+                    /* No timer to wait on, so report the timeout immediately
+                     * rather than blocking for longer than asked. */
+                    return 0;
+                }
+                /* With no deadline and no timer, waiting on the serial line
+                 * alone is the best there is. */
             }
         }
 
@@ -741,8 +786,10 @@ static long poll_fds(struct pollfd *fds, unsigned long nfds, int64_t timeout_ns)
         /* Readiness is rechecked before acting on expiry, so input that arrives
          * in the same moment as the timer is not dropped. */
         if (armed && (badge & timeout_notification_badge()) != 0) {
-            expired = 1;
             armed = 0;
+            if (timeout_ns > 0 && timeout_time() >= deadline) {
+                expired = 1;
+            }
         }
     }
 }

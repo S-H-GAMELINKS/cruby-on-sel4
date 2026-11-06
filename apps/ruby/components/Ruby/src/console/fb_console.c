@@ -111,6 +111,65 @@ static const uint32_t palette[16] = {
     0x555555, 0xff5555, 0x55ff55, 0xffff55, 0x5555ff, 0xff55ff, 0x55ffff, 0xffffff,
 };
 
+/* The intensities of the xterm 6x6x6 colour cube, one axis. */
+static const uint8_t cube_levels[6] = { 0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff };
+
+/*
+ * A colour index as a pixel, over the whole xterm 256 colour range: the sixteen
+ * above, then the 6x6x6 cube from 16, then 24 steps of grey from 232.
+ *
+ * Computed rather than tabulated, since a cell keeps only its index and the
+ * arithmetic is cheaper than the uncached store it precedes.
+ */
+static uint32_t colour_of(uint8_t index)
+{
+    if (index < 16) {
+        return palette[index];
+    }
+    if (index >= 232) {
+        uint32_t level = 8u + 10u * (uint32_t)(index - 232);
+
+        return (level << 16) | (level << 8) | level;
+    }
+
+    index -= 16;
+    return ((uint32_t)cube_levels[index / 36] << 16) |
+           ((uint32_t)cube_levels[(index / 6) % 6] << 8) |
+           (uint32_t)cube_levels[index % 6];
+}
+
+/*
+ * A true colour as the nearest index above. Programs that emit true colour mostly
+ * pick it from a 256 colour palette anyway, so rounding into the same cube loses
+ * little; near-greys go to the grey ramp, which is finer than the cube's
+ * diagonal. This is the same rounding Termfront's Color.rgb_to_256 does, so a
+ * colour it sends either way comes out the same.
+ */
+static uint8_t index_of_rgb(int r, int g, int b)
+{
+    int rg = r > g ? r - g : g - r;
+    int gb = g > b ? g - b : b - g;
+    int rb = r > b ? r - b : b - r;
+
+    r = r < 0 ? 0 : (r > 255 ? 255 : r);
+    g = g < 0 ? 0 : (g > 255 ? 255 : g);
+    b = b < 0 ? 0 : (b > 255 ? 255 : b);
+
+    if (rg < 8 && gb < 8 && rb < 8) {
+        int average = (r + g + b) / 3;
+
+        if (average < 8) {
+            return 16;
+        }
+        if (average > 247) {
+            return 231;
+        }
+        return (uint8_t)(232 + (average - 8) * 23 / 240);
+    }
+
+    return (uint8_t)(16 + (r * 5 / 255) * 36 + (g * 5 / 255) * 6 + (b * 5 / 255));
+}
+
 enum parse_state {
     STATE_GROUND,
     STATE_ESCAPE,
@@ -463,6 +522,9 @@ static int cells_for(uint32_t codepoint)
     if (codepoint >= CONSOLE_FONT_FIRST && codepoint <= CONSOLE_FONT_LAST) {
         return 1;
     }
+    if (codepoint <= 0xffff && console_block_find((uint16_t)codepoint) != NULL) {
+        return 1;
+    }
 
     glyph = codepoint <= 0xffff ? shinonome_find((uint16_t)codepoint) : NULL;
     if (glyph != NULL) {
@@ -476,9 +538,20 @@ static glyph_t glyph_for(uint16_t codepoint)
 {
     glyph_t glyph;
     const console_glyph_t *found;
+    const uint8_t *block;
 
     if (codepoint >= CONSOLE_FONT_FIRST && codepoint <= CONSOLE_FONT_LAST) {
         glyph.rows = console_font[codepoint - CONSOLE_FONT_FIRST];
+        glyph.stride = 1;
+        glyph.src_w = CONSOLE_FONT_WIDTH;
+        glyph.src_h = CONSOLE_FONT_HEIGHT;
+        glyph.cells = 1;
+        return glyph;
+    }
+
+    block = console_block_find(codepoint);
+    if (block != NULL) {
+        glyph.rows = block;
         glyph.stride = 1;
         glyph.src_w = CONSOLE_FONT_WIDTH;
         glyph.src_h = CONSOLE_FONT_HEIGHT;
@@ -536,8 +609,8 @@ static void draw_glyph(int row, int col, int span, int rows_tall, int cursor)
     int cell_h = CONSOLE_FONT_HEIGHT * scale;
     int width_px = cell_w * span;
     int height_px = cell_h * rows_tall;
-    uint32_t fg = palette[cell->fg & 0x0f];
-    uint32_t bg = palette[cell->bg & 0x0f];
+    uint32_t fg = colour_of(cell->fg);
+    uint32_t bg = colour_of(cell->bg);
     int pixels_x;
     int pixels_y;
 
@@ -848,11 +921,14 @@ static void put_printable(uint32_t codepoint)
         invalidate_rows(con.row, affected);
     }
 
+    /* Bold brightens only the eight basic colours. Anything from the 256 colour
+     * range already names exactly the colour wanted, and setting a bit in its
+     * index would pick an unrelated one. */
     if (con.reverse) {
         fg = con.bg;
-        bg = (uint8_t)(con.bold ? (con.fg | 8u) : con.fg);
+        bg = (uint8_t)(con.bold && con.fg < 8 ? (con.fg | 8u) : con.fg);
     } else {
-        fg = (uint8_t)(con.bold ? (con.fg | 8u) : con.fg);
+        fg = (uint8_t)(con.bold && con.fg < 8 ? (con.fg | 8u) : con.fg);
         bg = con.bg;
     }
 
@@ -954,11 +1030,26 @@ static void apply_sgr(void)
             con.fg = (uint8_t)(p - 90 + 8);
         } else if (p >= 100 && p <= 107) {
             con.bg = (uint8_t)(p - 100 + 8);
+        } else if (p == 38 || p == 48) {
+            /* 256 colour (38;5;n) and true colour (38;2;r;g;b). The arguments
+             * are consumed here whether or not they make sense, since leaving
+             * them would have them read as further attributes. */
+            uint8_t *target = p == 38 ? &con.fg : &con.bg;
+            int kind = i + 1 < con.nparams ? con.params[i + 1] : -1;
+
+            if (kind == 5 && i + 2 < con.nparams) {
+                int n = con.params[i + 2];
+
+                *target = (uint8_t)(n < 0 ? 0 : (n > 255 ? 255 : n));
+                i += 2;
+            } else if (kind == 2 && i + 4 < con.nparams) {
+                *target = index_of_rgb(con.params[i + 2], con.params[i + 3], con.params[i + 4]);
+                i += 4;
+            } else {
+                /* Malformed or truncated; nothing after it can be trusted. */
+                break;
+            }
         }
-        /* 38 and 48 introduce 256 colour and true colour selections whose
-         * arguments would have to be consumed as well. Nothing here emits them,
-         * and ignoring the introducer alone would misread the arguments as
-         * further attributes, so they are left out deliberately. */
     }
 }
 

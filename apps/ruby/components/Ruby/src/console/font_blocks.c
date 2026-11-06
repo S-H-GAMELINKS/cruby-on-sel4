@@ -1,0 +1,45 @@
+/*
+ * Half width box drawing and block elements, drawn by hand on the 8x16 grid of
+ * the console font. See console_block_find in console.h for why these are not
+ * taken from Shinonome.
+ *
+ * Only the characters something here prints are present. Adding one is a matter
+ * of sixteen rows, most significant bit leftmost, kept in code point order.
+ */
+
+#include "console.h"
+
+typedef struct {
+    uint16_t codepoint;
+    uint8_t rows[CONSOLE_FONT_HEIGHT];
+} block_glyph_t;
+
+static const block_glyph_t blocks[] = {
+    /* U+2500 BOX DRAWINGS LIGHT HORIZONTAL */
+    { 0x2500, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+    /* U+2580 UPPER HALF BLOCK */
+    { 0x2580, { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+    /* U+2584 LOWER HALF BLOCK */
+    { 0x2584, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } },
+    /* U+2588 FULL BLOCK */
+    { 0x2588, { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } },
+    /* U+2591 LIGHT SHADE */
+    { 0x2591, { 0x88, 0x22, 0x88, 0x22, 0x88, 0x22, 0x88, 0x22,
+                0x88, 0x22, 0x88, 0x22, 0x88, 0x22, 0x88, 0x22 } },
+};
+
+const uint8_t *console_block_find(uint16_t codepoint)
+{
+    /* Few enough that a linear scan costs less than getting a bisection right. */
+    for (size_t i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {
+        if (blocks[i].codepoint == codepoint) {
+            return blocks[i].rows;
+        }
+    }
+
+    return NULL;
+}

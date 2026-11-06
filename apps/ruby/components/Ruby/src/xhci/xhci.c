@@ -67,6 +67,15 @@ static uint32_t event_index;
 static uint32_t event_cycle = 1;
 static uintptr_t event_paddr;
 
+/*
+ * Valve's vendor id, which the Steam Deck's controller carries. Its own HID
+ * interface reports every button, where the keyboard it also presents types
+ * only for the D-pad, A and B. Setting this to 0 goes back to reading it as a
+ * keyboard, should the Deck's firmware turn out not to send those reports.
+ */
+#define STEAM_VENDOR 0x28de
+#define STEAM_READ_OWN_INTERFACE 1
+
 /* At most this many devices are enumerated. A keyboard is the only one wanted,
  * and a hub full of them would not help. */
 #define MAX_DEVICES 8
@@ -103,6 +112,9 @@ typedef struct {
      * A report says what is held, so the previous one is what turns it into
      * what was pressed. */
     bool keyboard;
+    /* Whether they are instead the Steam Deck controller's own, which are
+     * turned into a keyboard's; `previous` is then the last of those. */
+    bool steam;
     uint8_t previous[8];
 } device_t;
 
@@ -683,13 +695,19 @@ static int control_out(device_t *device, usb_setup_t setup)
  * describes it.
  */
 static bool find_interrupt_endpoint(const volatile uint8_t *config, size_t length,
+                                    bool prefer_vendor,
                                     uint8_t *address, uint16_t *packet, uint8_t *interval,
-                                    bool *keyboard)
+                                    bool *keyboard, bool *steam)
 {
     size_t at = 0;
     bool in_keyboard = false;
+    bool in_vendor = false;
+    const volatile usb_endpoint_descriptor_t *keyboard_endpoint = NULL;
+    const volatile usb_endpoint_descriptor_t *vendor_endpoint = NULL;
+    const volatile usb_endpoint_descriptor_t *chosen;
 
     *keyboard = false;
+    *steam = false;
 
     while (at + 2 <= length) {
         uint8_t size = config[at];
@@ -703,34 +721,48 @@ static bool find_interrupt_endpoint(const volatile uint8_t *config, size_t lengt
                 (const volatile usb_interface_descriptor_t *)&config[at];
 
             /* Class 3 is HID; boot protocol 1 is a keyboard, which is the one
-             * arrangement whose reports mean the same thing on every device. */
+             * arrangement whose reports mean the same thing on every device.
+             * Protocol 0 is a HID interface with reports of its own, which on
+             * the Steam Deck's controller is the one that has every button. */
             in_keyboard = interface->interface_class == 0x03 &&
                           interface->interface_protocol == 0x01;
+            in_vendor = interface->interface_class == 0x03 &&
+                        interface->interface_protocol == 0x00;
         }
         if (type == USB_DESCRIPTOR_ENDPOINT && size >= sizeof(usb_endpoint_descriptor_t)) {
             const volatile usb_endpoint_descriptor_t *endpoint =
                 (const volatile usb_endpoint_descriptor_t *)&config[at];
 
+            /* Keep looking past interrupt endpoints that are not wanted: a
+             * device may offer several, and only some say anything this can
+             * read. The first of each kind is kept. */
             if ((endpoint->attributes & USB_ENDPOINT_TYPE_MASK) == USB_ENDPOINT_TYPE_INTERRUPT &&
                 (endpoint->address & USB_ENDPOINT_IN) != 0) {
-                /* Keep looking past an interrupt endpoint that is not a
-                 * keyboard's: a device may offer several, and only one of them
-                 * says anything this can read. */
-                if (!in_keyboard) {
-                    at += size;
-                    continue;
+                if (in_keyboard && keyboard_endpoint == NULL) {
+                    keyboard_endpoint = endpoint;
                 }
-                *address = endpoint->address;
-                *packet = endpoint->max_packet_size & 0x7ff;
-                *interval = endpoint->interval;
-                *keyboard = true;
-                return true;
+                if (in_vendor && vendor_endpoint == NULL) {
+                    vendor_endpoint = endpoint;
+                }
             }
         }
         at += size;
     }
 
-    return false;
+    if (prefer_vendor && vendor_endpoint != NULL) {
+        chosen = vendor_endpoint;
+        *steam = true;
+    } else if (keyboard_endpoint != NULL) {
+        chosen = keyboard_endpoint;
+        *keyboard = true;
+    } else {
+        return false;
+    }
+
+    *address = chosen->address;
+    *packet = chosen->max_packet_size & 0x7ff;
+    *interval = chosen->interval;
+    return true;
 }
 
 /*
@@ -1049,7 +1081,9 @@ static bool enumerate_port(uint32_t port, device_t *device)
         }
 
         if (!find_interrupt_endpoint((const volatile uint8_t *)config, total,
-                                     &address, &packet, &interval, &device->keyboard)) {
+                                     STEAM_READ_OWN_INTERFACE && device->vendor == STEAM_VENDOR,
+                                     &address, &packet, &interval,
+                                     &device->keyboard, &device->steam)) {
             const volatile uint8_t *raw = (const volatile uint8_t *)config;
 
             /*
@@ -1260,7 +1294,7 @@ bool xhci_init(void)
      * every controller and what each port answered, which is where to start.
      */
     for (int i = 0; i < device_count; i++) {
-        if (devices[i].keyboard && devices[i].dci != 0) {
+        if ((devices[i].keyboard || devices[i].steam) && devices[i].dci != 0) {
             report_quiet("c%u[%s]%s", controller_count, controller_bars, summary);
             return true;
         }
@@ -1313,6 +1347,8 @@ void xhci_poll(void)
             }
             if (device->keyboard) {
                 hid_keyboard_report(device->report, got, device->previous);
+            } else if (device->steam) {
+                hid_steam_report(device->report, got, device->previous);
             }
         }
 

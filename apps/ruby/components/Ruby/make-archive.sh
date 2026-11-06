@@ -9,12 +9,13 @@ set -eu
 
 cruby_src=$1    # extracted CRuby source tree
 cruby_build=$2  # CRuby build directory, which holds the generated rbconfig.rb
-script_dir=$3   # this component's scripts/ directory
-stage=$4        # staging directory assembled below
-out_cpio=$5
-out_asm=$6
-out_obj=$7
-cc=$8
+termfront=$3    # extracted Termfront source tree
+script_dir=$4   # this component's scripts/ directory
+stage=$5        # staging directory assembled below
+out_cpio=$6
+out_asm=$7
+out_obj=$8
+cc=$9
 
 rm -rf "$stage"
 mkdir -p "$stage"
@@ -36,6 +37,24 @@ cp -R "$reline_lib"/. "$stage/"
 for f in forwardable tempfile delegate tmpdir fileutils; do
     cp "$cruby_src/lib/$f.rb" "$stage/"
 done
+
+# Termfront, under a directory of its own so that its lib/ and data/ keep the
+# relationship mission/base.rb relies on: it finds data/events by going up from
+# its own __dir__. The audio is left out -- it is most of the repository by size,
+# and there is nothing here to play it with. Without a manifest the game simply
+# stays silent.
+mkdir -p "$stage/termfront/data"
+cp -R "$termfront/lib" "$stage/termfront/"
+cp -R "$termfront/data/events" "$stage/termfront/data/"
+cp "$termfront/LICENSE.txt" "$stage/termfront/"
+
+# json's Ruby half. The C half is linked in; json/ext.rb requires it by the
+# names extinit.c registers.
+cp -R "$cruby_src/ext/json/lib/." "$stage/"
+
+# What Termfront pulls in from the standard library besides json. set and thread
+# need nothing: Set is a core class in Ruby 4.0 and both are provided features.
+cp "$cruby_src/lib/shellwords.rb" "$stage/"
 
 # Generated per build, so it comes from the build tree, not the source tree.
 cp "$cruby_build/rbconfig.rb" "$stage/"

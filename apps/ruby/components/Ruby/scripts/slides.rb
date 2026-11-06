@@ -621,41 +621,72 @@ end
 
 SLIDES = load_slides
 
-start_time = Time.now
-index = 0
-shown_index = nil
-shown_timer = nil
+# Where the talk is, kept outside the loop below so that leaving the slides for
+# something else and coming back resumes the same page with the clock still
+# running from when the talk began.
+$slide_index = 0
+$talk_started_at = nil
 
-loop do
-  remaining = TALK_SECONDS - (Time.now - start_time)
-  timer = format_mmss(remaining)
+# The page shown before each of the last few keys, oldest first. The launcher's
+# hidden command is eight arrows, which move the deck before the command is
+# recognised; they cancel out in the middle of the deck but not at either end,
+# where a move is clamped. Rewinding to the page before them puts it back.
+SLIDE_TRAIL_LENGTH = 8
+$slide_trail = []
 
-  if index != shown_index
-    render_slide(SLIDES[index], index, SLIDES.length, remaining)
-    shown_index = index
-    shown_timer = timer
-  elsif timer != shown_timer
-    # Only the header changed, and repainting the whole slide to move a clock
-    # would be visible as a flicker on an uncached framebuffer.
-    render_header(index, SLIDES.length, remaining)
-    shown_timer = timer
-  end
-
-  key = poll_key(REFRESH_INTERVAL)
-  next unless key
-
-  case key
-  when :right, :down, :space, :enter, :page_down, 'n', 'N'
-    index += 1 if index + 1 < SLIDES.length
-  when :left, :up, :back, :page_up, 'p', 'P'
-    index -= 1 if index.positive?
-  when :home then index = 0
-  when :end then index = SLIDES.length - 1
-  when :quit, :escape then break
-  end
+def rewind_slide_trail
+  $slide_index = $slide_trail.first if $slide_trail.length == SLIDE_TRAIL_LENGTH
+  $slide_trail = []
 end
 
-cls
-at(SCREEN_H / 2, 1)
-$stdout.syswrite(center('slides closed'))
-$stdout.syswrite("\n")
+# Show the deck until it is closed. Returns normally on q; anything raised from
+# a read -- the launcher's hidden command -- passes straight through, since
+# nothing here rescues more than StandardError.
+def present_slides
+  $talk_started_at ||= Time.now
+  shown_index = nil
+  shown_timer = nil
+
+  loop do
+    index = $slide_index
+    remaining = TALK_SECONDS - (Time.now - $talk_started_at)
+    timer = format_mmss(remaining)
+
+    if index != shown_index
+      render_slide(SLIDES[index], index, SLIDES.length, remaining)
+      shown_index = index
+      shown_timer = timer
+    elsif timer != shown_timer
+      # Only the header changed, and repainting the whole slide to move a clock
+      # would be visible as a flicker on an uncached framebuffer.
+      render_header(index, SLIDES.length, remaining)
+      shown_timer = timer
+    end
+
+    key = poll_key(REFRESH_INTERVAL)
+    next unless key
+
+    $slide_trail = ($slide_trail + [index]).last(SLIDE_TRAIL_LENGTH)
+
+    case key
+    when :right, :down, :space, :enter, :page_down, 'n', 'N'
+      $slide_index += 1 if index + 1 < SLIDES.length
+    when :left, :up, :back, :page_up, 'p', 'P'
+      $slide_index -= 1 if index.positive?
+    when :home then $slide_index = 0
+    when :end then $slide_index = SLIDES.length - 1
+    # Escape deliberately does nothing. On the Steam Deck it is the B button,
+    # which is too easy to press in the middle of a talk to be the way out.
+    when :quit then break
+    end
+  end
+
+  cls
+  at(SCREEN_H / 2, 1)
+  $stdout.syswrite(center('slides closed'))
+  $stdout.syswrite("\n")
+end
+
+# Run directly as the entry script, the deck is all there is. The launcher sets
+# this flag before loading the file and decides itself when to present.
+present_slides unless $slides_launcher

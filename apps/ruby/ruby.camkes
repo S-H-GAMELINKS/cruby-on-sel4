@@ -203,7 +203,9 @@ assembly {
     ruby.fb_scale = 2;
     ruby.fb_rotate = 0;
 
-    /* "/shell.rb" for the Reline REPL, "/slides.rb" for the presentation. */
+    /* "/main.rb" for the presentation with Termfront behind it (the hidden
+     * command switches between them), "/slides.rb" for the presentation alone,
+     * "/shell.rb" for the Reline REPL. */
     /* Data at 0x60, status and command at 0x64. The range is inclusive of the
      * first and exclusive of the last, so this covers both. */
     keyboard.port_attributes = "0x60:0x65";
@@ -228,6 +230,6 @@ assembly {
      */
     ruby.dma_pool = 0x40000;
 
-    ruby.entry_script = "/slides.rb";
+    ruby.entry_script = "/main.rb";
   }
 }

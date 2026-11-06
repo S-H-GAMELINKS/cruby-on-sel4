@@ -34,8 +34,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <autoconf.h>
 #include <camkes/io.h>
 #include <platsupport/io.h>
+#include <sel4/sel4.h>
+
+#include "../hidden_command.h"
 
 #define PS2_DATA 0x60
 #define PS2_STATUS 0x64
@@ -59,6 +63,7 @@
  * nothing this produces a byte for. The layout is the one every PC has had since
  * the AT: positional, so this is a US keyboard by construction. */
 static const char scancode_ascii[PS2_BREAK] = {
+    [0x01] = '\033',                                          /* escape */
     [0x02] = '1', [0x03] = '2', [0x04] = '3', [0x05] = '4', [0x06] = '5',
     [0x07] = '6', [0x08] = '7', [0x09] = '8', [0x0a] = '9', [0x0b] = '0',
     [0x0c] = '-', [0x0d] = '=', [0x0e] = '\177',                /* backspace */
@@ -99,6 +104,8 @@ static int ops_ready;
 static int present;
 static int probed;
 
+static hidden_command_t hidden_command;
+
 static char queue[QUEUE_SIZE];
 static size_t queue_head;
 static size_t queue_tail;
@@ -130,12 +137,21 @@ int ps2_available(void)
         int status = port_read(PS2_STATUS);
 
         present = status != PS2_NO_DEVICE;
-        /* Said once. On a machine with a serial line this is how an absent
+        /* Said once, on the serial line only. There it is how an absent
          * controller is told apart from a bug; the Steam Deck answers 0xff,
          * which is how it was established that its firmware does not emulate
-         * one. */
-        printf("PS/2: status=0x%02x %s\n", status,
-               present ? "controller present" : "nothing there");
+         * one. It stays off the screen, because the first time anyone asks is
+         * when the slide tool waits for its first key, with the title page
+         * already drawn. */
+#ifdef CONFIG_PRINTING
+        char line[64];
+        int len = snprintf(line, sizeof(line), "PS/2: status=0x%02x %s\n", status,
+                           present ? "controller present" : "nothing there");
+
+        for (int i = 0; i < len && i < (int)sizeof(line) - 1; i++) {
+            seL4_DebugPutChar(line[i]);
+        }
+#endif
     }
 
     return present;
@@ -153,6 +169,27 @@ static void queue_push(const char *bytes, size_t len)
         }
         queue[queue_tail] = bytes[i];
         queue_tail = next;
+    }
+}
+
+/* The hidden command's name for a key, from its scancode. */
+static hidden_key_t hidden_key_for(uint8_t code, int extended)
+{
+    if (extended) {
+        switch (code) {
+        case 0x48: return HIDDEN_KEY_UP;
+        case 0x50: return HIDDEN_KEY_DOWN;
+        case 0x4b: return HIDDEN_KEY_LEFT;
+        case 0x4d: return HIDDEN_KEY_RIGHT;
+        case 0x1c: return HIDDEN_KEY_ENTER;    /* keypad enter */
+        default: return HIDDEN_KEY_OTHER;
+        }
+    }
+
+    switch (code) {
+    case 0x01: return HIDDEN_KEY_ESCAPE;
+    case 0x1c: return HIDDEN_KEY_ENTER;
+    default: return HIDDEN_KEY_OTHER;
     }
 }
 
@@ -193,6 +230,30 @@ static void ps2_drain(void)
         if ((code & PS2_BREAK) != 0) {
             extended = 0;
             continue;
+        }
+
+        /*
+         * The keyboard's own typematic repeat arrives as further make codes,
+         * indistinguishable from presses, so holding a key does feed the
+         * hidden command more than once. That only matters to someone holding
+         * an arrow while typing it, and the command is not typed that way.
+         */
+        switch (hidden_command_follow(&hidden_command, hidden_key_for(code, extended))) {
+        case HIDDEN_SWALLOW:
+            extended = 0;
+            continue;
+        case HIDDEN_TOGGLE: {
+            char toggle = HIDDEN_COMMAND_TOGGLE_BYTE;
+
+            extended = 0;
+            queue_push(&toggle, 1);
+            continue;
+        }
+        case HIDDEN_RELEASE_ESCAPE:
+            queue_push("\033", 1);
+            break;
+        case HIDDEN_PASS:
+            break;
         }
 
         if (extended) {
